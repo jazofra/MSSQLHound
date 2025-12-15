@@ -267,7 +267,15 @@ param(
     # Interval in seconds for periodic file size updates (0 to disable)
     [int]$FileSizeUpdateInterval = 5,
 
-    [switch]$Version
+    [switch]$Version,
+
+    [switch]$CheckAllComputers,
+
+    [int[]]$PortList = @(1433),
+
+    [int]$PortScanTimeout = 500,
+
+    [int]$PortScanThreads = 20
 )
 
 # Display help text
@@ -5033,7 +5041,10 @@ function Get-LocalGroupMembers {
 function Get-MSSQLServerFromString {
     param (
         [string]$Server,
-        [string]$DomainName = $script:Domain
+        [string]$DomainName = $script:Domain,
+        [string]$ServiceAccountName,
+        [string]$ServiceAccountSid,
+        [string]$SPN
     )
 
     # Specify SPN
@@ -5065,45 +5076,60 @@ function Get-MSSQLServerFromString {
     }
     
     if ($hostSid) {
-        # Create ObjectIdentifier
-        $objectIdentifier = "${hostSid}:${portOrInstance}"
-        
-        # Create or update server object
-        if (-not $script:serversToProcess.ContainsKey($objectIdentifier)) {
-            $script:serversToProcess[$objectIdentifier] = [PSCustomObject]@{
-                ObjectIdentifier = $objectIdentifier
-                ServerName = $hostPart
-                Port = if ($portOrInstance -match '^\d+$') { $portOrInstance } else { 1433 }
-                InstanceName = if ($portOrInstance -match '^\d+$') { $null } else { $portOrInstance }
-                ServiceAccountSIDs = @()
-                ServicePrincipalNames = @()
-                ServerFullName = "$($hostPart):$(if ($portOrInstance) { $portOrInstance } else { 1433 })"
-            }
-        } else {
-            # Update ServerName to prefer FQDN
-            $currentServerName = $script:serversToProcess[$objectIdentifier].ServerName
-            
-            # If current name is short (no dots) and new name is FQDN (has dots), update it
-            if ($currentServerName -notmatch '\.' -and $hostPart -match '\.') {
-                $script:serversToProcess[$objectIdentifier].ServerName = $hostPart
-                Write-Verbose "Updated ServerName from '$currentServerName' to FQDN '$hostPart'"
-            }
-            # If both are FQDNs or both are short names, keep the first one found
+        Add-MSSQLServerToQueue -HostName $hostPart -HostSid $hostSid -PortOrInstance $portOrInstance -ServiceAccountName $ServiceAccountName -ServiceAccountSid $ServiceAccountSid -SPN $SPN
+    }
+}
+
+function Add-MSSQLServerToQueue {
+    param(
+        [string]$HostName,
+        [string]$HostSid,
+        [string]$PortOrInstance,
+        [string]$ServiceAccountName,
+        [string]$ServiceAccountSid,
+        [string]$SPN
+    )
+
+    # Create ObjectIdentifier
+    $objectIdentifier = "${HostSid}:${PortOrInstance}"
+
+    # Create or update server object
+    if (-not $script:serversToProcess.ContainsKey($objectIdentifier)) {
+        $script:serversToProcess[$objectIdentifier] = [PSCustomObject]@{
+            ObjectIdentifier = $objectIdentifier
+            ServerName = $HostName
+            Port = if ($PortOrInstance -match '^\d+$') { $PortOrInstance } else { 1433 }
+            InstanceName = if ($PortOrInstance -match '^\d+$') { $null } else { $PortOrInstance }
+            ServiceAccountSIDs = @()
+            ServicePrincipalNames = @()
+            ServerFullName = "$($HostName):$(if ($PortOrInstance) { $PortOrInstance } else { 1433 })"
         }
+    } else {
+        # Update ServerName to prefer FQDN
+        $currentServerName = $script:serversToProcess[$objectIdentifier].ServerName
         
-        # Add service account if not already present
-        $existingServiceAccount = $script:serversToProcess[$objectIdentifier].ServiceAccountSIDs | Where-Object { $_.ObjectIdentifier -eq $serviceAccountSid }
+        # If current name is short (no dots) and new name is FQDN (has dots), update it
+        if ($currentServerName -notmatch '\.' -and $HostName -match '\.') {
+            $script:serversToProcess[$objectIdentifier].ServerName = $HostName
+            Write-Verbose "Updated ServerName from '$currentServerName' to FQDN '$HostName'"
+        }
+        # If both are FQDNs or both are short names, keep the first one found
+    }
+
+    # Add service account if not already present
+    if ($ServiceAccountSid) {
+        $existingServiceAccount = $script:serversToProcess[$objectIdentifier].ServiceAccountSIDs | Where-Object { $_.ObjectIdentifier -eq $ServiceAccountSid }
         if (-not $existingServiceAccount) {
             $script:serversToProcess[$objectIdentifier].ServiceAccountSIDs += [PSCustomObject]@{
-                Name = $serviceAccountName
-                ObjectIdentifier = $serviceAccountSid
+                Name = $ServiceAccountName
+                ObjectIdentifier = $ServiceAccountSid
             }
         }
-        
-        # Add SPN if not already present
-        if ($spn -notin $script:serversToProcess[$objectIdentifier].ServicePrincipalNames) {
-            $script:serversToProcess[$objectIdentifier].ServicePrincipalNames += $spn
-        }
+    }
+
+    # Add SPN if not already present
+    if ($SPN -and $SPN -notin $script:serversToProcess[$objectIdentifier].ServicePrincipalNames) {
+        $script:serversToProcess[$objectIdentifier].ServicePrincipalNames += $SPN
     }
 }
 
@@ -5161,7 +5187,7 @@ function Get-MSSQLServersFromSPNs {
             
             foreach ($spn in $result.Properties['serviceprincipalname']) {
                 if ($spn -match '^MSSQLSvc/([^:]+)(:(.+))?$') {
-                    Get-MSSQLServerFromString -Server $spn
+                    Get-MSSQLServerFromString -Server $spn -ServiceAccountName $serviceAccountName -ServiceAccountSid $serviceAccountSid -SPN $spn
                 }
             }
         }
@@ -5185,6 +5211,110 @@ function Get-MSSQLServersFromSPNs {
     catch {
         Write-Error "Error collecting MSSQL SPNs: $_"
         return @()
+    }
+}
+
+function Get-MSSQLServersFromAllComputers {
+    param (
+        [string]$DomainName = $script:Domain,
+        [int[]]$Ports = $PortList,
+        [int]$Timeout = $PortScanTimeout,
+        [int]$Threads = $PortScanThreads
+    )
+
+    try {
+        Write-Host "Querying Active Directory for all computer objects..." -ForegroundColor Cyan
+
+        $searcher = [adsisearcher]"(objectClass=computer)"
+        if ($DomainName) {
+            $searcher.SearchRoot = [adsi]"LDAP://$DomainName"
+        }
+        $searcher.PageSize = 1000
+        # Load necessary properties
+        $searcher.PropertiesToLoad.AddRange(@('dnsHostName', 'objectSid', 'samAccountName'))
+
+        $computers = $searcher.FindAll()
+
+        Write-Host "Found $($computers.Count) computer objects. Starting port scan on ports $($Ports -join ', ')..." -ForegroundColor Cyan
+
+        # Prepare runspace pool
+        $runspacePool = [runspacefactory]::CreateRunspacePool(1, $Threads)
+        $runspacePool.Open()
+
+        $jobs = @()
+
+        foreach ($computer in $computers) {
+            $dnsHostName = $computer.Properties['dnsHostName'][0]
+
+            # Skip if no DNS hostname
+            if (-not $dnsHostName) { continue }
+
+            # Use raw SID bytes to avoid translation overhead if possible, but we need string for our hash
+            $sid = (New-Object System.Security.Principal.SecurityIdentifier($computer.Properties['objectSid'][0], 0)).Value
+
+            foreach ($port in $Ports) {
+
+                $scriptBlock = {
+                    param($Target, $Port, $Timeout, $Sid, $HostName)
+
+                    try {
+                        $client = New-Object System.Net.Sockets.TcpClient
+                        $connectTask = $client.ConnectAsync($Target, $Port)
+                        $wait = $connectTask.Wait($Timeout)
+
+                        if ($wait -and $client.Connected) {
+                            $client.Close()
+                            return @{
+                                HostName = $HostName
+                                Port = $Port
+                                Sid = $Sid
+                                IsOpen = $true
+                            }
+                        }
+                    } catch {}
+                    return $null
+                }
+
+                $job = [powershell]::Create().AddScript($scriptBlock).AddArgument($dnsHostName).AddArgument($port).AddArgument($Timeout).AddArgument($sid).AddArgument($dnsHostName)
+                $job.RunspacePool = $runspacePool
+
+                $jobs += [PSCustomObject]@{
+                    Pipe = $job
+                    Result = $job.BeginInvoke()
+                }
+            }
+        }
+
+        # Process results as they complete
+        Write-Host "Waiting for scan to complete..." -ForegroundColor Cyan
+
+        $completedCount = 0
+        $totalJobs = $jobs.Count
+
+        foreach ($job in $jobs) {
+            $result = $job.Pipe.EndInvoke($job.Result)
+            $job.Pipe.Dispose()
+
+            if ($result -and $result.IsOpen) {
+                # Add to main processing queue
+                Add-MSSQLServerToQueue -HostName $result.HostName -HostSid $result.Sid -PortOrInstance $result.Port
+
+                Write-Host "  Found open port $($result.Port) on $($result.HostName)" -ForegroundColor Green
+            }
+
+            $completedCount++
+            if ($totalJobs -gt 0 -and $completedCount % 100 -eq 0) {
+                Write-Progress -Activity "Scanning ports" -Status "$completedCount / $totalJobs completed" -PercentComplete (($completedCount / $totalJobs) * 100)
+            }
+        }
+
+        $runspacePool.Close()
+        $runspacePool.Dispose()
+
+        Write-Host "`nScan complete. Processing queue updated." -ForegroundColor Cyan
+
+    } catch {
+        Write-Error "Error scanning computers: $_"
     }
 }
 
@@ -9171,9 +9301,14 @@ if ($ServerInstance) {
     # Collect MSSQL SPNs from Active Directory if domain is available
     try {
         Get-MSSQLServersFromSPNs
+
+        # Check all computers if requested
+        if ($CheckAllComputers) {
+            Get-MSSQLServersFromAllComputers
+        }
     }
     catch {
-        Write-Warning "Could not collect MSSQL SPNs from Active Directory: $_"
+        Write-Warning "Could not collect MSSQL servers from Active Directory: $_"
     }
 }
 
