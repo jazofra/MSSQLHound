@@ -4582,6 +4582,7 @@ function Resolve-PrincipalInDomain {
                         }
                     }
                 }
+                }
             }
             
             if ($adObject) {
