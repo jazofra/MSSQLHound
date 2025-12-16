@@ -4531,8 +4531,20 @@ function Resolve-PrincipalInDomain {
             try {
                 $adObject = Get-ADComputer @adParams -ErrorAction Stop
             } catch {
-                # Try Computer by SID
-                try {
+                # Try appending $ if not present (for computer accounts)
+                if ($Name -notmatch '\$$') {
+                    try {
+                        $adParams.Identity = "$Name`$"
+                        $adObject = Get-ADComputer @adParams -ErrorAction Stop
+                    } catch {
+                        # Reset Identity for subsequent attempts
+                        $adParams.Identity = $Name
+                    }
+                }
+
+                if (-not $adObject) {
+                    # Try Computer by SID
+                    try {
                     $adParams.Remove('Identity')
                     $adParams.LDAPFilter = "(objectSid=$Name)"
                     $adObject = Get-ADComputer @adParams -ErrorAction Stop
@@ -4721,6 +4733,7 @@ function Resolve-PrincipalInDomain {
             # Try different search filters
             $searchFilters = @(
                 "(samAccountName=$Name)",
+                "(samAccountName=$Name$)",
                 "(objectSid=$Name)",
                 "(userPrincipalName=$Name)",
                 "(dnsHostName=$Name)",
@@ -5065,6 +5078,11 @@ function Get-MSSQLServerFromString {
     
         if ($computer.SID) {
             $hostSid = $computer.SID
+        } elseif ($ServiceAccountSid -and ($ServiceAccountName -match '\$$')) {
+            # Fallback to ServiceAccountSid if provided and it's a computer account (ends in $)
+            # This handles cases where SPN host resolution fails but we know the service account is the computer
+            Write-Verbose "Using Service Account SID for host as fallback: $ServiceAccountName ($ServiceAccountSid)"
+            $hostSid = $ServiceAccountSid
         } else {
             Write-Warning "No SID found for $hostPart"
         }
