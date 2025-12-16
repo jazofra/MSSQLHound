@@ -4545,38 +4545,39 @@ function Resolve-PrincipalInDomain {
                 if (-not $adObject) {
                     # Try Computer by SID
                     try {
-                    $adParams.Remove('Identity')
-                    $adParams.LDAPFilter = "(objectSid=$Name)"
-                    $adObject = Get-ADComputer @adParams -ErrorAction Stop
-                    if (-not $adObject) { throw }
-                } catch {
-                    # Try User
-                    try {
-                        $adParams.Remove('LDAPFilter')
-                        $adParams.Identity = $Name
-                        $adObject = Get-ADUser @adParams -ErrorAction Stop
+                        $adParams.Remove('Identity')
+                        $adParams.LDAPFilter = "(objectSid=$Name)"
+                        $adObject = Get-ADComputer @adParams -ErrorAction Stop
+                        if (-not $adObject) { throw }
                     } catch {
-                        # Try User by SID
+                        # Try User
                         try {
-                            $adParams.Remove('Identity')
-                            $adParams.LDAPFilter = "(objectSid=$Name)"
+                            $adParams.Remove('LDAPFilter')
+                            $adParams.Identity = $Name
                             $adObject = Get-ADUser @adParams -ErrorAction Stop
-                            if (-not $adObject) { throw }
                         } catch {
-                            # Try Group
+                            # Try User by SID
                             try {
-                                $adParams.Remove('LDAPFilter')
-                                $adParams.Identity = $Name
-                                $adObject = Get-ADGroup @adParams -ErrorAction Stop
+                                $adParams.Remove('Identity')
+                                $adParams.LDAPFilter = "(objectSid=$Name)"
+                                $adObject = Get-ADUser @adParams -ErrorAction Stop
+                                if (-not $adObject) { throw }
                             } catch {
-                                # Try Group by SID
+                                # Try Group
                                 try {
-                                    $adParams.Remove('Identity')
-                                    $adParams.LDAPFilter = "(objectSid=$Name)"
+                                    $adParams.Remove('LDAPFilter')
+                                    $adParams.Identity = $Name
                                     $adObject = Get-ADGroup @adParams -ErrorAction Stop
-                                    if (-not $adObject) { throw }
                                 } catch {
-                                    Write-Verbose "No AD object found for '$Name' in domain '$Domain'"
+                                    # Try Group by SID
+                                    try {
+                                        $adParams.Remove('Identity')
+                                        $adParams.LDAPFilter = "(objectSid=$Name)"
+                                        $adObject = Get-ADGroup @adParams -ErrorAction Stop
+                                        if (-not $adObject) { throw }
+                                    } catch {
+                                        Write-Verbose "No AD object found for '$Name' in domain '$Domain'"
+                                    }
                                 }
                             }
                         }
