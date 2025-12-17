@@ -139,6 +139,10 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
     var cookie uintptr = 0 // Initially NULL
 
     for {
+        if w.debug {
+            fmt.Printf("[DEBUG] Starting Loop. Cookie: %x\n", cookie)
+        }
+
         var pageControl uintptr
         // ldap_create_page_controlW
         // args: ld, pageSize, cookie, isCritical, outputControl
@@ -146,11 +150,15 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
             w.ld,
             uintptr(PAGE_SIZE),
             cookie,
-            0, // not critical
+            1, // IsCritical=1 (Force server to fail if paging not supported)
             uintptr(unsafe.Pointer(&pageControl)),
         )
         if ret != LDAP_SUCCESS {
             return nil, fmt.Errorf("ldap_create_page_control failed: %d", ret)
+        }
+
+        if w.debug {
+            fmt.Printf("[DEBUG] Page control created. Ptr: %x\n", pageControl)
         }
 
         // Setup Server Controls Array
@@ -181,10 +189,11 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
 
         if ret != LDAP_SUCCESS {
             ldap_control_free.Call(pageControl)
-            return nil, fmt.Errorf("ldap_search_ext_s failed: %d", ret)
+            return nil, fmt.Errorf("ldap_search_ext_s failed: %d. Check if server supports Paged Results.", ret)
         }
 
         // Process results
+        entriesInPage := 0
         // Iterate results
         for entry, _, _ := ldap_first_entry.Call(w.ld, res); entry != 0; entry, _, _ = ldap_next_entry.Call(w.ld, entry) {
             // Get values
@@ -209,6 +218,11 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
                 }
                 ldap_value_free.Call(valsPtr)
             }
+            entriesInPage++
+        }
+
+        if w.debug {
+            fmt.Printf("[DEBUG] Page entries: %d. Total accumulated: %d\n", entriesInPage, len(results))
         }
 
         // Get paging cookie from response
@@ -264,13 +278,15 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
 
         // Check content of cookie (berval)
         // struct berval { ULONG bv_len; PCHAR bv_val; }
-        // On 64-bit: 8 bytes (padded ulong/uint32?) + 8 bytes ptr
-        // ULONG is 32-bit on Windows.
-        // Alignment might make it 8 bytes? No, usually 4.
-        // Let's unsafe read.
+        // ULONG is 32-bit. PCHAR is 64-bit on x64.
+        // Alignment of PCHAR is 8 bytes.
+        // Struct size: 4 (len) + 4 (padding) + 8 (ptr) = 16 bytes.
+
         bvLen := *(*uint32)(unsafe.Pointer(nextCookie))
-        // bvVal := *(*uintptr)(unsafe.Pointer(nextCookie + 8)) // offset 8 for 64-bit alignment? Or 4?
-        // standard alignment: 4 bytes len, 4 bytes padding, 8 bytes ptr.
+
+        if w.debug {
+            fmt.Printf("[DEBUG] Next Cookie Len: %d. Ptr: %x\n", bvLen, nextCookie)
+        }
 
         if bvLen == 0 {
              ber_bvfree.Call(nextCookie)
@@ -278,9 +294,6 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
         }
 
         // Update cookie for next iteration
-        // Must free old cookie if it wasn't null?
-        // ldap_create_page_control copies the cookie.
-        // We should free the previous cookie if we had one from parse_control?
         if cookie != 0 {
              ber_bvfree.Call(cookie)
         }
