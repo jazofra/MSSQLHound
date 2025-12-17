@@ -238,7 +238,9 @@ func (c *MSSQLCollector) collectDatabases(ctx context.Context, db *sql.DB, info 
 
 func (c *MSSQLCollector) collectDatabasePrincipals(ctx context.Context, db *sql.DB, dbInfo *models.Database) error {
     // Switch context to database
-    _, err := db.ExecContext(ctx, fmt.Sprintf("USE [%s]", dbInfo.Name))
+    // Escape closing bracket for safety
+    safeDbName := strings.ReplaceAll(dbInfo.Name, "]", "]]")
+    _, err := db.ExecContext(ctx, fmt.Sprintf("USE [%s]", safeDbName))
     if err != nil { return err }
 
     rows, err := db.QueryContext(ctx, QueryDatabasePrincipals)

@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -22,7 +23,7 @@ func main() {
 	serverInstance := flag.String("server", "", "Target MSSQL Server (host:port or host\\instance)")
     username := flag.String("username", "", "SQL Username")
     password := flag.String("password", "", "SQL Password")
-    authType := flag.String("auth", "SQL", "Authentication type: 'SQL' or 'Windows' (requires Windows)")
+    authType := flag.String("auth", "", "Authentication type: 'SQL' or 'Windows'. Defaults to Windows if no username provided.")
 	checkAllComputers := flag.Bool("check-all", false, "Scan all computers in AD for MSSQL")
     threads := flag.Int("threads", 10, "Number of concurrent threads for processing")
     portThreads := flag.Int("port-scan-threads", 100, "Threads for port scanning")
@@ -30,7 +31,16 @@ func main() {
     dc := flag.String("dc", "", "Domain Controller")
 	flag.Parse()
 
-	log.Println("Starting MSSQLHound (Go Port)...")
+    // Determine Auth Type
+    finalAuthType := "Windows"
+    if *username != "" {
+        finalAuthType = "SQL"
+    }
+    if *authType != "" {
+        finalAuthType = *authType
+    }
+
+	log.Printf("Starting MSSQLHound (Go Port)... Auth Mode: %s", finalAuthType)
 
 	var targets []string
 
@@ -39,14 +49,35 @@ func main() {
 		targets = append(targets, *serverInstance)
 	} else {
         // LDAP Discovery
-        if *domain == "" {
-             // Try to get from env or system?
+        targetDomain := *domain
+        targetDC := *dc
+
+        // Auto-discover domain
+        if targetDomain == "" {
+            targetDomain = os.Getenv("USERDNSDOMAIN")
+            if targetDomain == "" {
+                 // Try parsing from USERDOMAIN or hostname?
+                 // USERDNSDOMAIN is standard on Windows AD joined machines.
+            }
         }
 
-        session, err := discovery.NewLDAPSession(*dc, *domain, "", "", false)
-        if err != nil {
-             log.Printf("LDAP connection failed (skipping AD enum): %v", err)
-        } else {
+        // Auto-discover DC
+        if targetDC == "" && targetDomain != "" {
+            _, addrs, err := net.LookupSRV("ldap", "tcp", targetDomain)
+            if err == nil && len(addrs) > 0 {
+                targetDC = addrs[0].Target
+                // Strip trailing dot
+                targetDC = strings.TrimSuffix(targetDC, ".")
+            }
+        }
+
+        if targetDomain != "" && targetDC != "" {
+            log.Printf("Auto-discovered environment: Domain=%s, DC=%s", targetDomain, targetDC)
+
+            session, err := discovery.NewLDAPSession(targetDC, targetDomain, "", "", false)
+            if err != nil {
+                 log.Printf("LDAP connection failed (skipping AD enum): %v", err)
+            } else {
             defer session.Close()
             spns, err := session.FindMSSQLSPNs()
             if err == nil {
@@ -72,6 +103,7 @@ func main() {
                      }
                 }
             }
+        } // end if targetDomain...
         }
 	}
 
@@ -89,24 +121,36 @@ func main() {
 
 	// 2. Collection & Processing (Worker Pool)
     resultsChan := make(chan *models.MSSQLServerInfo, len(jobQueue))
-    sem := make(chan struct{}, *threads)
 
-    for _, target := range jobQueue {
-        go func(tgt string) {
-            sem <- struct{}{}
-            defer func() { <-sem }()
+    // Create a jobs channel
+    jobs := make(chan string, len(jobQueue))
+    for _, j := range jobQueue {
+        jobs <- j
+    }
+    close(jobs)
 
-            host, port, instance := parseTarget(tgt)
-            col := collector.NewMSSQLCollector(host, port, instance, *username, *password, *domain, *authType)
-            info, err := col.Collect(context.Background())
-            if err != nil {
-                log.Printf("Failed to collect from %s: %v", tgt, err)
-                resultsChan <- nil
-                return
+    // Start workers
+    for w := 0; w < *threads; w++ {
+        go func() {
+            for tgt := range jobs {
+                host, port, instance := parseTarget(tgt)
+                // Use default domain if none provided, or discovered one
+                dom := *domain
+                if dom == "" {
+                     dom = os.Getenv("USERDOMAIN")
+                }
+
+                col := collector.NewMSSQLCollector(host, port, instance, *username, *password, dom, finalAuthType)
+                info, err := col.Collect(context.Background())
+                if err != nil {
+                    log.Printf("Failed to collect from %s: %v", tgt, err)
+                    resultsChan <- nil
+                } else {
+                    resultsChan <- info
+                    log.Printf("Successfully collected from %s", tgt)
+                }
             }
-            resultsChan <- info
-            log.Printf("Successfully collected from %s", tgt)
-        }(target)
+        }()
     }
 
 	// 3. Conversion & Output
