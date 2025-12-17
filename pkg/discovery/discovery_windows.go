@@ -124,9 +124,11 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
         }
 
         // Setup Server Controls Array
-        var serverControls []*uintptr
-        serverControls = append(serverControls, &pageControl)
-        serverControls = append(serverControls, nil)
+        // wldap32 expects a NULL-terminated array of PLDAPControl (which are pointers to LDAPControl structs)
+        // pageControl IS the PLDAPControl (uintptr)
+        var serverControls []uintptr
+        serverControls = append(serverControls, pageControl)
+        serverControls = append(serverControls, 0)
         serverControlsPtr := uintptr(unsafe.Pointer(&serverControls[0]))
 
         var res uintptr
