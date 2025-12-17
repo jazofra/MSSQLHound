@@ -84,10 +84,10 @@ func main() {
                 log.Printf("Found %d MSSQL SPNs", len(spns))
                  // Parse SPNs to targets (MSSQLSvc/host:port)
                  for _, spn := range spns {
-                     parts := strings.Split(strings.TrimPrefix(spn, "MSSQLSvc/"), ":")
-                     if len(parts) > 0 {
-                         targets = append(targets, parts[0]) // just host for now, ideally host:port
-                     }
+                     // SPN format: MSSQLSvc/host:port or MSSQLSvc/host
+                     trimmed := strings.TrimPrefix(spn, "MSSQLSvc/")
+                     // Append as is, parseTarget handles both formats
+                     targets = append(targets, trimmed)
                  }
             }
 
