@@ -39,16 +39,13 @@ func NewLDAPSession(domainController string, domain string, username string, pas
             return nil, fmt.Errorf("failed to bind to LDAP: %v", err)
         }
     } else {
-        // Attempt Windows SSPI Bind (if supported/implemented)
-        // Otherwise, this falls through to unauthenticated/anonymous which usually fails in AD.
-        err = BindCurrentWindowsUser(conn)
+        // Fallback to anonymous bind (unauthenticated) which usually fails for AD searches
+        // But for non-AD LDAP or misconfigured AD, it might work.
+        // We do NOT call BindCurrentWindowsUser here because that logic is now in NewWindowsDiscoverer
+        // which bypasses go-ldap entirely.
+        err = conn.UnauthenticatedBind("")
         if err != nil {
-            // Log this? For now just return the error if it was an attempt
-            // If it's a stub, it returns error.
-            // If the error is "not supported", we might try anonymous?
-            // But AD Anonymous is useless.
-            // So we return the error.
-            return nil, fmt.Errorf("LDAP authentication failed (no creds provided and SSPI failed): %v", err)
+             return nil, fmt.Errorf("anonymous bind failed: %v", err)
         }
     }
 

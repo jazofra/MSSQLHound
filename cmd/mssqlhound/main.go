@@ -75,7 +75,7 @@ func main() {
             log.Printf("Auto-discovered environment: Domain=%s, DC=%s", targetDomain, targetDC)
 
             // Pass explicit credentials if provided, otherwise empty strings trigger auto-auth attempt (SSPI/Anonymous)
-            session, err := discovery.NewLDAPSession(targetDC, targetDomain, *username, *password, false)
+            session, err := discovery.NewSession(targetDC, targetDomain, *username, *password, false)
             if err != nil {
                  log.Printf("LDAP connection failed (skipping AD enum): %v", err)
             } else {
