@@ -42,7 +42,10 @@ func (c *Converter) Convert(server *models.MSSQLServerInfo) {
         }
 	}
 
-    // 5. Process Edges (Permissions)
+    // 5. Service Accounts
+    c.addServiceAccountNodes(server)
+
+    // 6. Process Edges (Permissions)
     c.processServerPermissions(server)
     for _, db := range server.Databases {
         c.processDatabasePermissions(server, &db)

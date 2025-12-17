@@ -25,7 +25,8 @@ var (
     ldap_create_page_control = wldap32.NewProc("ldap_create_page_controlW")
     ldap_parse_result = wldap32.NewProc("ldap_parse_resultW")
     ldap_parse_page_control = wldap32.NewProc("ldap_parse_page_controlW")
-    ldap_control_free = wldap32.NewProc("ldap_control_free")
+    ldap_control_free = wldap32.NewProc("ldap_control_freeW")
+    ldap_controls_free = wldap32.NewProc("ldap_controls_freeW")
     ber_bvfree = wldap32.NewProc("ber_bvfree")
 )
 
@@ -106,7 +107,6 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
     // Paging loop
     var results []string
     var cookie uintptr = 0 // Initially NULL
-    controlOID, _ := syscall.UTF16PtrFromString(LDAP_CONTROL_PAGED_RESULTS)
 
     for {
         var pageControl uintptr
@@ -215,15 +215,7 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
         // Clean up
         ldap_control_free.Call(pageControl)
         if responseControlsPtr != 0 {
-             ldap_control_free.Call(responseControlsPtr) // Actually array of controls, usually freed by ldap_controls_free?
-             // wldap32 uses ldap_controls_free for arrays? Or just control_free for single?
-             // Documentation says ldap_parse_result allocates array, user must free.
-             // We'll assume one control for now or check leaks later if critical.
-             // Actually, responseControlsPtr is **LDAPControl.
-             // wldap32.dll: ldap_controls_freeW?
-             // Use ldap_control_free for the pageControl we created.
-             // For the one from parse_result, we should use ldap_controls_free if available.
-             // Assuming minimal leak if not freed in this short lived process.
+             ldap_controls_free.Call(responseControlsPtr)
         }
         ldap_msgfree.Call(res)
 
