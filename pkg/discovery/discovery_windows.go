@@ -16,27 +16,24 @@ var (
 	ldap_bind_s    = wldap32.NewProc("ldap_bind_sW")
 	ldap_search_s  = wldap32.NewProc("ldap_search_sW")
     ldap_search_ext_s = wldap32.NewProc("ldap_search_ext_sW")
+    ldap_search_init_page = wldap32.NewProc("ldap_search_init_pageW")
+    ldap_get_next_page_s = wldap32.NewProc("ldap_get_next_page_s")
+    ldap_search_abandon_page = wldap32.NewProc("ldap_search_abandon_page")
 	ldap_msgfree   = wldap32.NewProc("ldap_msgfree")
 	ldap_unbind    = wldap32.NewProc("ldap_unbind")
     ldap_first_entry = wldap32.NewProc("ldap_first_entry")
     ldap_next_entry  = wldap32.NewProc("ldap_next_entry")
     ldap_get_values  = wldap32.NewProc("ldap_get_valuesW")
     ldap_value_free  = wldap32.NewProc("ldap_value_freeW")
-    ldap_create_page_control = wldap32.NewProc("ldap_create_page_controlW")
-    ldap_parse_result = wldap32.NewProc("ldap_parse_resultW")
-    ldap_parse_page_control = wldap32.NewProc("ldap_parse_page_controlW")
-    ldap_control_free = wldap32.NewProc("ldap_control_freeW")
-    ldap_controls_free = wldap32.NewProc("ldap_controls_freeW")
     ldap_set_option    = wldap32.NewProc("ldap_set_optionW")
-    ber_bvfree = wldap32.NewProc("ber_bvfree")
 )
 
 const (
 	LDAP_AUTH_NEGOTIATE = 0x486
 	LDAP_SCOPE_SUBTREE  = 2
 	LDAP_SUCCESS        = 0
+    LDAP_NO_RESULTS_RETURNED = 0x5E // 94
     LDAP_PORT           = 389
-    LDAP_CONTROL_PAGED_RESULTS = "1.2.840.113556.1.4.319"
     PAGE_SIZE = 1000
 
     LDAP_OPT_PROTOCOL_VERSION = 0x11
@@ -134,67 +131,55 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
     attrs = append(attrs, nil)
     attrsPtr := uintptr(unsafe.Pointer(&attrs[0]))
 
-    // Paging loop
+    // Initialize Page Search
+    var searchHandle uintptr
+    // ldap_search_init_pageW
+    // Args: ld, dn, scope, filter, attrs, attrsonly, serverctrls, clientctrls, pagetimelimit, totalsizelimit, sortkeys
+    ret, _, _ := ldap_search_init_page.Call(
+        w.ld,
+        uintptr(unsafe.Pointer(basePtr)),
+        uintptr(LDAP_SCOPE_SUBTREE),
+        uintptr(unsafe.Pointer(filterPtr)),
+        attrsPtr,
+        0, // attrsonly
+        0, // serverctrls
+        0, // clientctrls
+        0, // pagetimelimit
+        0, // totalsizelimit
+        0, // sortkeys
+    )
+
+    searchHandle = ret
+    if searchHandle == 0 {
+        return nil, fmt.Errorf("ldap_search_init_page failed")
+    }
+    defer ldap_search_abandon_page.Call(w.ld, searchHandle)
+
     var results []string
-    var cookie uintptr = 0 // Initially NULL
+    var totalCount uint32
 
     for {
-        if w.debug {
-            fmt.Printf("[DEBUG] Starting Loop. Cookie: %x\n", cookie)
-        }
-
-        var pageControl uintptr
-        // ldap_create_page_controlW
-        // args: ld, pageSize, cookie, isCritical, outputControl
-        ret, _, _ := ldap_create_page_control.Call(
-            w.ld,
-            uintptr(PAGE_SIZE),
-            cookie,
-            1, // IsCritical=1 (Force server to fail if paging not supported)
-            uintptr(unsafe.Pointer(&pageControl)),
-        )
-        if ret != LDAP_SUCCESS {
-            return nil, fmt.Errorf("ldap_create_page_control failed: %d", ret)
-        }
-
-        if w.debug {
-            fmt.Printf("[DEBUG] Page control created. Ptr: %x\n", pageControl)
-        }
-
-        // Setup Server Controls Array
-        // wldap32 expects a NULL-terminated array of PLDAPControl (which are pointers to LDAPControl structs)
-        // pageControl IS the PLDAPControl (uintptr)
-        var serverControls []uintptr
-        serverControls = append(serverControls, pageControl)
-        serverControls = append(serverControls, 0)
-        serverControlsPtr := uintptr(unsafe.Pointer(&serverControls[0]))
-
         var res uintptr
-
-        // ldap_search_ext_sW
-        // args: ld, base, scope, filter, attrs, attrsonly, serverctrls, clientctrls, timeout, sizeLimit, res
-        ret, _, _ = ldap_search_ext_s.Call(
+        // ldap_get_next_page_s
+        // Args: ld, searchHandle, timeout(NULL), pageSize, totalCount(OUT), results(OUT)
+        ret, _, _ := ldap_get_next_page_s.Call(
             w.ld,
-            uintptr(unsafe.Pointer(basePtr)),
-            uintptr(LDAP_SCOPE_SUBTREE),
-            uintptr(unsafe.Pointer(filterPtr)),
-            attrsPtr,
-            0,
-            serverControlsPtr,
-            0, // client controls
+            searchHandle,
             0, // timeout
-            0, // sizelimit
+            uintptr(PAGE_SIZE),
+            uintptr(unsafe.Pointer(&totalCount)),
             uintptr(unsafe.Pointer(&res)),
         )
 
+        if ret == LDAP_NO_RESULTS_RETURNED {
+            break
+        }
         if ret != LDAP_SUCCESS {
-            ldap_control_free.Call(pageControl)
-            return nil, fmt.Errorf("ldap_search_ext_s failed: %d. Check if server supports Paged Results.", ret)
+            return nil, fmt.Errorf("ldap_get_next_page_s failed: %d", ret)
         }
 
-        // Process results
+        // Iterate results in this page
         entriesInPage := 0
-        // Iterate results
         for entry, _, _ := ldap_first_entry.Call(w.ld, res); entry != 0; entry, _, _ = ldap_next_entry.Call(w.ld, entry) {
             // Get values
             valsPtr, _, _ := ldap_get_values.Call(w.ld, entry, uintptr(unsafe.Pointer(attrPtr)))
@@ -220,88 +205,11 @@ func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error)
             }
             entriesInPage++
         }
+        ldap_msgfree.Call(res)
 
         if w.debug {
             fmt.Printf("[DEBUG] Page entries: %d. Total accumulated: %d\n", entriesInPage, len(results))
         }
-
-        // Get paging cookie from response
-        // ldap_parse_resultW
-        // args: ld, res, errCode, matchedDN, errMsg, referrals, serverControls, freeIt
-        var responseControlsPtr uintptr
-        ret, _, _ = ldap_parse_result.Call(
-            w.ld,
-            res,
-            0, // errCode
-            0, // matchedDN
-            0, // errMsg
-            0, // referrals
-            uintptr(unsafe.Pointer(&responseControlsPtr)),
-            0, // freeIt (we free res later)
-        )
-
-        if ret != LDAP_SUCCESS {
-             ldap_msgfree.Call(res)
-             ldap_control_free.Call(pageControl)
-             break
-        }
-
-        // ldap_parse_page_controlW
-        // args: ld, serverControls, totalCount, cookie
-        var totalCount uint32
-        var nextCookie uintptr // BERVAL*
-
-        ret, _, _ = ldap_parse_page_control.Call(
-            w.ld,
-            responseControlsPtr,
-            uintptr(unsafe.Pointer(&totalCount)),
-            uintptr(unsafe.Pointer(&nextCookie)),
-        )
-
-        // Clean up
-        ldap_control_free.Call(pageControl)
-        if responseControlsPtr != 0 {
-             ldap_controls_free.Call(responseControlsPtr)
-        }
-        ldap_msgfree.Call(res)
-
-        if ret != LDAP_SUCCESS {
-            break // Error or end
-        }
-
-        // Check if cookie is empty
-        // BERVAL struct: len (ULONG), val (char*)
-        // If val is NULL or len is 0
-        if nextCookie == 0 {
-            break
-        }
-
-        // Check content of cookie (berval)
-        // struct berval { ULONG bv_len; PCHAR bv_val; }
-        // ULONG is 32-bit. PCHAR is 64-bit on x64.
-        // Alignment of PCHAR is 8 bytes.
-        // Struct size: 4 (len) + 4 (padding) + 8 (ptr) = 16 bytes.
-
-        bvLen := *(*uint32)(unsafe.Pointer(nextCookie))
-
-        if w.debug {
-            fmt.Printf("[DEBUG] Next Cookie Len: %d. Ptr: %x\n", bvLen, nextCookie)
-        }
-
-        if bvLen == 0 {
-             ber_bvfree.Call(nextCookie)
-             break
-        }
-
-        // Update cookie for next iteration
-        if cookie != 0 {
-             ber_bvfree.Call(cookie)
-        }
-        cookie = nextCookie
-    }
-
-    if cookie != 0 {
-        ber_bvfree.Call(cookie)
     }
 
     return results, nil
