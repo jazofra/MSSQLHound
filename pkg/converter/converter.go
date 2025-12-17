@@ -45,10 +45,14 @@ func (c *Converter) Convert(server *models.MSSQLServerInfo) {
     // 5. Service Accounts
     c.addServiceAccountNodes(server)
 
-    // 6. Process Edges (Permissions)
+    // 6. Linked Servers
+    c.processLinkedServers(server)
+
+    // 7. Process Edges (Permissions and Relationships)
     c.processServerPermissions(server)
     for _, db := range server.Databases {
         c.processDatabasePermissions(server, &db)
+        c.processTrustworthy(server, &db)
     }
 }
 
@@ -91,13 +95,8 @@ func (c *Converter) addServerPrincipalNode(server *models.MSSQLServerInfo, p *mo
     c.Output.Graph.Nodes = append(c.Output.Graph.Nodes, node)
 
     // Membership Edges
-    // Add edges for members of this role (Role -> MemberOf -> Principal)
-    // NOTE: In MSSQL, if A is a member of B, B CONTAINS A.
-    // BUT the edge is usually A -> MemberOf -> B or B -> Contains -> A.
-    // MSSQLHound.ps1 creates MSSQL_MemberOf edges from member to role.
     if len(p.Members) > 0 {
          for _, memberName := range p.Members {
-             // We need to find the principal with this name to get its ID
              memberPrincipal := findServerPrincipalByName(server, memberName)
              if memberPrincipal != nil {
                  c.Output.Graph.Edges = append(c.Output.Graph.Edges, models.Edge{
@@ -107,6 +106,38 @@ func (c *Converter) addServerPrincipalNode(server *models.MSSQLServerInfo, p *mo
                  })
              }
          }
+    }
+
+    // MSSQL_HasLogin (AD Principal -> MSSQL Login)
+    // If the principal is a WINDOWS_LOGIN or WINDOWS_GROUP, it maps to an AD object (User/Group/Computer)
+    if strings.Contains(p.TypeDescription, "WINDOWS") && p.SecurityIdentifier != "" {
+        // Create AD Node
+        // We use the SID as the ID. BloodHound uses SID for AD nodes.
+        adNodeId := p.SecurityIdentifier
+        adKinds := []string{"Base", "User"} // Default to User
+        if strings.Contains(p.TypeDescription, "GROUP") {
+            adKinds = []string{"Base", "Group"}
+        } else if strings.Contains(p.Name, "$") {
+             adKinds = []string{"Base", "Computer"}
+        }
+
+        // Add the AD Node (if not exists logic handled by BH ingest usually, but we emit it)
+        c.Output.Graph.Nodes = append(c.Output.Graph.Nodes, models.Node{
+            Id: adNodeId,
+            Kinds: adKinds,
+            Properties: map[string]interface{}{
+                "name": p.Name, // This usually includes DOMAIN\Name
+                "objectid": adNodeId,
+            },
+            Label: p.Name,
+        })
+
+        // Add Edge
+        c.Output.Graph.Edges = append(c.Output.Graph.Edges, models.Edge{
+            Source: adNodeId,
+            Target: p.ObjectIdentifier,
+            Kind: "MSSQL_HasLogin",
+        })
     }
 }
 
@@ -236,9 +267,29 @@ func (c *Converter) processServerPermissions(server *models.MSSQLServerInfo) {
                      }
                 }
 
-                // Handle specific target object permissions
-                // In PS1: Set-EdgeContext resolves the target object from perm.TargetObjectIdentifier or class
-                // Here we need to map perm.SubEntityName back to an object ID.
+                // ALTER on Server Role (AddMember)
+                if perm.Permission == "ALTER" && perm.ClassDesc == "SERVER_ROLE" {
+                     target := findServerPrincipalByName(server, perm.SubEntityName)
+                     if target != nil {
+                         c.Output.Graph.Edges = append(c.Output.Graph.Edges, models.Edge{
+                             Source: p.ObjectIdentifier,
+                             Target: target.ObjectIdentifier,
+                             Kind: "MSSQL_AddMember",
+                         })
+                     }
+                }
+
+                // TAKE OWNERSHIP
+                if perm.Permission == "TAKE OWNERSHIP" && perm.ClassDesc == "SERVER_ROLE" {
+                     target := findServerPrincipalByName(server, perm.SubEntityName)
+                     if target != nil {
+                         c.Output.Graph.Edges = append(c.Output.Graph.Edges, models.Edge{
+                             Source: p.ObjectIdentifier,
+                             Target: target.ObjectIdentifier,
+                             Kind: "MSSQL_TakeOwnership",
+                         })
+                     }
+                }
             }
         }
     }

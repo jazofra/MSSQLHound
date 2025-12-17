@@ -104,7 +104,8 @@ func (w *WindowsDiscoverer) FindMSSQLSPNs() ([]string, error) {
 }
 
 func (w *WindowsDiscoverer) FindComputers() ([]string, error) {
-    filter := "(objectClass=computer)"
+    // Filter out disabled computers (userAccountControl bit 2)
+    filter := "(&(objectClass=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
     attr := "dNSHostName"
     return w.search(filter, attr)
 }

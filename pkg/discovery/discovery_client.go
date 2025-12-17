@@ -96,7 +96,8 @@ func (s *LDAPSession) FindMSSQLSPNs() ([]string, error) {
 // FindComputers searches for all computer objects (for -CheckAllComputers)
 func (s *LDAPSession) FindComputers() ([]string, error) {
     baseDN := s.domainToDN(s.Domain)
-    filter := "(objectClass=computer)"
+    // Filter out disabled computers
+    filter := "(&(objectClass=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
     attributes := []string{"dNSHostName"}
 
     searchRequest := ldap.NewSearchRequest(
