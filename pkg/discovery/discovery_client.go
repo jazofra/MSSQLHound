@@ -72,7 +72,8 @@ func (s *LDAPSession) FindMSSQLSPNs() ([]string, error) {
         nil,
     )
 
-    sr, err := s.Conn.Search(searchRequest)
+    // Use Paging for large result sets
+    sr, err := s.Conn.SearchWithPaging(searchRequest, 1000)
     if err != nil {
         return nil, err
     }
@@ -106,7 +107,7 @@ func (s *LDAPSession) FindComputers() ([]string, error) {
         nil,
     )
 
-    sr, err := s.Conn.Search(searchRequest)
+    sr, err := s.Conn.SearchWithPaging(searchRequest, 1000)
     if err != nil {
         return nil, err
     }
