@@ -63,21 +63,22 @@ func (c *MSSQLCollector) Collect(ctx context.Context) (*models.MSSQLServerInfo, 
 		Port:         c.Port,
 	}
 
-	// 1. Server Info
+	// 1. Server Info (Critical)
 	if err := c.collectServerInfo(ctx, db, info); err != nil {
 		return nil, fmt.Errorf("collectServerInfo: %v", err)
 	}
     // Set object identifier
     info.ObjectIdentifier = fmt.Sprintf("%s:%d", info.Name, c.Port)
 
-	// 2. Server Principals
+	// 2. Server Principals (Best Effort)
 	if err := c.collectServerPrincipals(ctx, db, info); err != nil {
-		return nil, fmt.Errorf("collectServerPrincipals: %v", err)
+        // Log warning
+        fmt.Printf("Warning: Failed to collect server principals from %s: %v\n", info.Name, err)
 	}
 
-	// 3. Databases
+	// 3. Databases (Best Effort)
 	if err := c.collectDatabases(ctx, db, info); err != nil {
-		return nil, fmt.Errorf("collectDatabases: %v", err)
+        fmt.Printf("Warning: Failed to collect databases from %s: %v\n", info.Name, err)
 	}
 
     // 4. Database Principals (Loop through DBs)
@@ -101,16 +102,14 @@ func (c *MSSQLCollector) Collect(ctx context.Context) (*models.MSSQLServerInfo, 
 }
 
 func (c *MSSQLCollector) collectServerInfo(ctx context.Context, db *sql.DB, info *models.MSSQLServerInfo) error {
-	row := db.QueryRowContext(ctx, QueryServerInfo)
+    // 1. Basic Info
+	row := db.QueryRowContext(ctx, QueryServerBasicInfo)
 
-    var serverName, machineName, instanceName, prodVer, svcName, svcAccount, authMode, extProt string
-	var isClustered, isHadr, crossDb, xpCmd, clr, ole, showAdv, scanStart, remAdmin, adHoc, trust int
+    var serverName, machineName, instanceName, prodVer, authMode, extProt string
+	var isClustered, isHadr int
 
-    // Using nullable types or sql.NullString is safer, but for brevity assuming non-null for system views usually
     err := row.Scan(
         &serverName, &machineName, &instanceName, &prodVer, &isClustered, &isHadr,
-        &svcName, &svcAccount,
-        &crossDb, &xpCmd, &clr, &ole, &showAdv, &scanStart, &remAdmin, &adHoc, &trust,
         &authMode, &extProt,
     )
     if err != nil {
@@ -121,19 +120,35 @@ func (c *MSSQLCollector) collectServerInfo(ctx context.Context, db *sql.DB, info
     info.Version = prodVer
     info.IsMixedModeAuthEnabled = (authMode == "SQL Server and Windows Authentication")
 
-    // Configurations
-    info.CrossDbOwnershipChaining = crossDb
-    info.XpCmdshell = xpCmd
-    info.ClrEnabled = clr
-    info.OleAutomationProcedures = ole
-    info.ShowAdvancedOptions = showAdv
-    info.ScanForStartupProcs = scanStart
-    info.RemoteAdminConnections = remAdmin
-    info.AdHocDistributedQueries = adHoc
-    info.Trustworthy = trust
+    // 2. Service Account (Privileged)
+    row = db.QueryRowContext(ctx, QueryServerServiceAccount)
+    var svcName, svcAccount string
+    if err := row.Scan(&svcName, &svcAccount); err == nil {
+        info.ServiceAccounts = []models.ServiceAccount{{Name: svcAccount}}
+    }
 
-    // Service Account
-    info.ServiceAccounts = []models.ServiceAccount{{Name: svcAccount}}
+    // 3. Configurations
+    rows, err := db.QueryContext(ctx, QueryServerConfiguration)
+    if err == nil {
+        defer rows.Close()
+        for rows.Next() {
+            var name string
+            var val int
+            if err := rows.Scan(&name, &val); err == nil {
+                switch name {
+                case "cross db ownership chaining": info.CrossDbOwnershipChaining = val
+                case "xp_cmdshell": info.XpCmdshell = val
+                case "clr enabled": info.ClrEnabled = val
+                case "Ole Automation Procedures": info.OleAutomationProcedures = val
+                case "show advanced options": info.ShowAdvancedOptions = val
+                case "scan for startup procs": info.ScanForStartupProcs = val
+                case "remote admin connections": info.RemoteAdminConnections = val
+                case "Ad Hoc Distributed Queries": info.AdHocDistributedQueries = val
+                case "trustworthy": info.Trustworthy = val
+                }
+            }
+        }
+    }
 
 	return nil
 }

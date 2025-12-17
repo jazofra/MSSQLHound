@@ -1,7 +1,7 @@
 package collector
 
 const (
-	QueryServerInfo = `
+	QueryServerBasicInfo = `
 SELECT
     -- Basic Server Info
     @@SERVERNAME AS ServerName,
@@ -11,29 +11,39 @@ SELECT
     CAST(SERVERPROPERTY('IsClustered') AS INT) AS IsClustered,
     CAST(SERVERPROPERTY('IsHadrEnabled') AS INT) AS IsHadrEnabled,
 
-    -- Service Account
-    (SELECT servicename FROM sys.dm_server_services WHERE servicename LIKE 'SQL Server (%') AS ServiceName,
-    (SELECT service_account FROM sys.dm_server_services WHERE servicename LIKE 'SQL Server (%') AS ServiceAccount,
-
-    -- Configuration
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'cross db ownership chaining') AS CrossDbOwnershipChaining,
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'xp_cmdshell') AS XpCmdshell,
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'clr enabled') AS ClrEnabled,
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'Ole Automation Procedures') AS OleAutomationProcedures,
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'show advanced options') AS ShowAdvancedOptions,
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'scan for startup procs') AS ScanForStartupProcs,
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'remote admin connections') AS RemoteAdminConnections,
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'Ad Hoc Distributed Queries') AS AdHocDistributedQueries,
-    (SELECT CAST(value AS INT) FROM sys.configurations WHERE name = 'trustworthy') AS Trustworthy,
-
     -- Authentication
     CASE SERVERPROPERTY('IsIntegratedSecurityOnly')
         WHEN 1 THEN 'Windows Authentication'
         WHEN 0 THEN 'SQL Server and Windows Authentication'
     END AS AuthenticationMode,
 
-    -- Extended Protection (Checking registry via xp_regread is restricted, relying on querying sys.configurations if applicable or skipping)
-    'Unknown' AS ExtendedProtection -- Placeholder as direct registry access is often blocked
+    'Unknown' AS ExtendedProtection
+`
+
+    QueryServerServiceAccount = `
+SELECT
+    servicename,
+    service_account
+FROM sys.dm_server_services
+WHERE servicename LIKE 'SQL Server (%'
+`
+
+    QueryServerConfiguration = `
+SELECT
+    name,
+    CAST(value AS INT) as val
+FROM sys.configurations
+WHERE name IN (
+    'cross db ownership chaining',
+    'xp_cmdshell',
+    'clr enabled',
+    'Ole Automation Procedures',
+    'show advanced options',
+    'scan for startup procs',
+    'remote admin connections',
+    'Ad Hoc Distributed Queries',
+    'trustworthy'
+)
 `
 
 	QueryServerPrincipals = `
