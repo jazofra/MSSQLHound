@@ -27,6 +27,7 @@ var (
     ldap_parse_page_control = wldap32.NewProc("ldap_parse_page_controlW")
     ldap_control_free = wldap32.NewProc("ldap_control_freeW")
     ldap_controls_free = wldap32.NewProc("ldap_controls_freeW")
+    ldap_set_option    = wldap32.NewProc("ldap_set_optionW")
     ber_bvfree = wldap32.NewProc("ber_bvfree")
 )
 
@@ -37,6 +38,11 @@ const (
     LDAP_PORT           = 389
     LDAP_CONTROL_PAGED_RESULTS = "1.2.840.113556.1.4.319"
     PAGE_SIZE = 1000
+
+    LDAP_OPT_PROTOCOL_VERSION = 0x11
+    LDAP_VERSION3             = 3
+    LDAP_OPT_REFERRALS        = 0x02
+    LDAP_OPT_OFF              = 0
 )
 
 type WindowsDiscoverer struct {
@@ -50,6 +56,14 @@ func NewWindowsDiscoverer(domainController string, domain string) (*WindowsDisco
 	if ld == 0 {
 		return nil, fmt.Errorf("ldap_init failed")
 	}
+
+    // Set LDAP v3
+    version := uintptr(LDAP_VERSION3)
+    ldap_set_option.Call(ld, uintptr(LDAP_OPT_PROTOCOL_VERSION), uintptr(unsafe.Pointer(&version)))
+
+    // Disable Referrals
+    referrals := uintptr(LDAP_OPT_OFF)
+    ldap_set_option.Call(ld, uintptr(LDAP_OPT_REFERRALS), uintptr(unsafe.Pointer(&referrals)))
 
 	ret, _, _ := ldap_connect.Call(ld, 0)
 	if ret != LDAP_SUCCESS {
