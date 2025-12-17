@@ -43,7 +43,6 @@ const (
     LDAP_VERSION3             = 3
     LDAP_OPT_REFERRALS        = 0x02
     LDAP_OPT_OFF              = 0
-    PAGE_SIZE                 = 500 // Reduced to 500 to test paging trigger
 )
 
 type WindowsDiscoverer struct {
