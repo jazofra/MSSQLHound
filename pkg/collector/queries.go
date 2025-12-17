@@ -56,6 +56,7 @@ SELECT
     p.create_date,
     p.modify_date,
     p.default_database_name,
+    p.credential_id,
     SUSER_SID(p.name) AS sid,
 
     -- Get members for roles
@@ -172,5 +173,35 @@ SELECT
     create_date,
     modify_date
 FROM sys.credentials
+`
+
+    QueryProxyAccounts = `
+SELECT
+    p.proxy_id,
+    p.name AS proxy_name,
+    p.credential_id,
+    c.name AS credential_name,
+    c.credential_identity,
+    p.enabled,
+    p.description,
+    -- Get subsystems this proxy can access
+    STUFF((
+        SELECT ', ' + ss.subsystem
+        FROM msdb.dbo.sysproxysubsystem ps
+        INNER JOIN msdb.dbo.syssubsystems ss ON ps.subsystem_id = ss.subsystem_id
+        WHERE ps.proxy_id = p.proxy_id
+        FOR XML PATH('')
+    ), 1, 2, '') AS subsystems,
+    -- Get principals that can use this proxy (using sid column)
+    STUFF((
+        SELECT ', ' + SUSER_SNAME(spl.sid)
+        FROM msdb.dbo.sysproxylogin spl
+        WHERE spl.proxy_id = p.proxy_id
+            AND SUSER_SNAME(spl.sid) IS NOT NULL
+        FOR XML PATH('')
+    ), 1, 2, '') AS authorized_principals
+FROM msdb.dbo.sysproxies p
+INNER JOIN sys.credentials c ON p.credential_id = c.credential_id
+ORDER BY p.proxy_id
 `
 )

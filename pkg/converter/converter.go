@@ -48,7 +48,10 @@ func (c *Converter) Convert(server *models.MSSQLServerInfo) {
     // 6. Linked Servers
     c.processLinkedServers(server)
 
-    // 7. Process Edges (Permissions and Relationships)
+    // 7. Proxy Accounts
+    c.processProxyAccounts(server)
+
+    // 8. Process Edges (Permissions and Relationships)
     c.processServerPermissions(server)
     for _, db := range server.Databases {
         c.processDatabasePermissions(server, &db)
@@ -106,6 +109,39 @@ func (c *Converter) addServerPrincipalNode(server *models.MSSQLServerInfo, p *mo
                  })
              }
          }
+    }
+
+    // MSSQL_HasMappedCred (Server Principal -> Credential)
+    if p.HasCredential != nil {
+        // Find the actual credential object
+        cred := findCredentialById(server, p.HasCredential.CredentialId)
+        if cred != nil {
+             // Create Credential Node? Usually not a node in BH graph?
+             // PS1 creates "Base" nodes for credentials.
+             // We need to create a Node for the credential identity (the AD user it uses).
+             // But Wait, `MSSQL_HasMappedCred` edge goes from Principal -> CredentialIdentity(SID).
+             // We need to resolve the CredentialIdentity to SID.
+             // PS1 does `Resolve-DomainPrincipal`. We don't have that easily here.
+             // Best effort: Use the CredentialIdentity string as ID if no SID.
+
+             targetId := cred.CredentialIdentity // Fallback
+             // If we had resolved SID, use it.
+             // Assuming we create a node for it.
+             c.Output.Graph.Nodes = append(c.Output.Graph.Nodes, models.Node{
+                 Id: targetId,
+                 Kinds: []string{"User", "Base"}, // Guessing User
+                 Properties: map[string]interface{}{
+                     "name": cred.CredentialIdentity,
+                 },
+                 Label: cred.CredentialIdentity,
+             })
+
+             c.Output.Graph.Edges = append(c.Output.Graph.Edges, models.Edge{
+                 Source: p.ObjectIdentifier,
+                 Target: targetId,
+                 Kind: "MSSQL_HasMappedCred",
+             })
+        }
     }
 
     // MSSQL_HasLogin (AD Principal -> MSSQL Login)

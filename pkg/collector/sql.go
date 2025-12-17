@@ -93,7 +93,12 @@ func (c *MSSQLCollector) Collect(ctx context.Context) (*models.MSSQLServerInfo, 
         // Warning
     }
 
-    // 6. Linked Servers
+    // 6. Proxy Accounts (Best Effort - requires msdb permissions)
+    if err := c.collectProxyAccounts(ctx, db, info); err != nil {
+        fmt.Printf("Warning: Failed to collect proxy accounts from %s: %v\n", info.Name, err)
+    }
+
+    // 7. Linked Servers
     if err := c.collectLinkedServers(ctx, db, info); err != nil {
         // Warning
     }
@@ -165,10 +170,11 @@ func (c *MSSQLCollector) collectServerPrincipals(ctx context.Context, db *sql.DB
         var sid []byte
         var memberStr, memberOfStr, permStr sql.NullString
         var createDate, modifyDate, defaultDB sql.NullString
+        var credentialID sql.NullString
 
 		if err := rows.Scan(
             &p.Name, &p.PrincipalID, &p.TypeDescription, &p.IsDisabled, &p.IsFixedRole,
-            &createDate, &modifyDate, &defaultDB, &sid,
+            &createDate, &modifyDate, &defaultDB, &credentialID, &sid,
             &memberStr, &memberOfStr, &permStr,
         ); err != nil {
 			return err
@@ -182,6 +188,14 @@ func (c *MSSQLCollector) collectServerPrincipals(ctx context.Context, db *sql.DB
         p.ModifyDate = modifyDate.String
         p.DefaultDatabaseName = defaultDB.String
         p.SQLServerName = info.Name
+
+        // Link Credential if exists
+        if credentialID.Valid {
+             // We can't link directly to the Credential object yet because we haven't collected them.
+             // But we can store the ID to link later in Converter.
+             // Or better, we populate a dummy credential with just ID for now.
+             p.HasCredential = &models.Credential{CredentialId: credentialID.String}
+        }
 
         // Parse Members
         if memberStr.Valid && memberStr.String != "" {
