@@ -29,9 +29,6 @@ func NewMSSQLCollector(host string, port int, instance string, username string, 
 
     // Instance handling (if using SQL Browser resolution, go-mssqldb handles 'server=host\instance')
     if instance != "" && instance != "MSSQLSERVER" {
-        // If port is default 1433, might be ignored if instance name is provided for browser lookup
-        // But if port is provided explicitly, use it.
-        // For 'server=host\instance', do not specify port usually, unless necessary.
         if port == 0 {
              connStr = fmt.Sprintf("server=%s\\%s;", host, instance)
              if authType == "Windows" {
@@ -68,11 +65,10 @@ func (c *MSSQLCollector) Collect(ctx context.Context) (*models.MSSQLServerInfo, 
 
 	// 1. Server Info
 	if err := c.collectServerInfo(ctx, db, info); err != nil {
-		// Log error but continue? Or fail hard?
 		return nil, fmt.Errorf("collectServerInfo: %v", err)
 	}
     // Set object identifier
-    info.ObjectIdentifier = fmt.Sprintf("%s:%d", info.Name, c.Port) // Simple ID for now, PS1 uses complex SID resolution
+    info.ObjectIdentifier = fmt.Sprintf("%s:%d", info.Name, c.Port)
 
 	// 2. Server Principals
 	if err := c.collectServerPrincipals(ctx, db, info); err != nil {
@@ -88,7 +84,6 @@ func (c *MSSQLCollector) Collect(ctx context.Context) (*models.MSSQLServerInfo, 
     for i := range info.Databases {
         if err := c.collectDatabasePrincipals(ctx, db, &info.Databases[i]); err != nil {
             // Log warning, continue
-             // fmt.Printf("Warning: Failed to collect principals for DB %s: %v\n", info.Databases[i].Name, err)
         }
     }
 
@@ -110,8 +105,6 @@ func (c *MSSQLCollector) collectServerInfo(ctx context.Context, db *sql.DB, info
 
     var serverName, machineName, instanceName, prodVer, svcName, svcAccount, authMode, extProt string
 	var isClustered, isHadr, crossDb, xpCmd, clr, ole, showAdv, scanStart, remAdmin, adHoc, trust int
-    // Scan all cols
-    // Note: Null handling is important.
 
     // Using nullable types or sql.NullString is safer, but for brevity assuming non-null for system views usually
     err := row.Scan(
@@ -166,7 +159,6 @@ func (c *MSSQLCollector) collectServerPrincipals(ctx context.Context, db *sql.DB
 			return err
 		}
 
-        // Use SDDL format for SIDs
         sddl := utils.ConvertSidToSddl(sid)
         p.ObjectIdentifier = sddl
         p.SecurityIdentifier = sddl
@@ -180,12 +172,6 @@ func (c *MSSQLCollector) collectServerPrincipals(ctx context.Context, db *sql.DB
         if memberStr.Valid && memberStr.String != "" {
             p.Members = strings.Split(memberStr.String, ",")
         }
-
-        // Parse MemberOf (Need to resolve to Objects later, for now just strings)
-        // The model expects []ServerPrincipal, but here we just have names.
-        // We will store names temporarily or handle linkage in the Converter phase.
-        // For now, let's change the query or logic. The PS1 logic builds objects then links.
-        // I'll leave the struct empty and handle it if needed or store metadata.
 
         // Parse Permissions
         if permStr.Valid && permStr.String != "" {
@@ -230,7 +216,7 @@ func (c *MSSQLCollector) collectDatabases(ctx context.Context, db *sql.DB, info 
         }
 
         d.OwnerLoginName = ownerName.String
-        d.ObjectIdentifier = fmt.Sprintf("%s-%s", info.Name, d.Name) // Simplified ID
+        d.ObjectIdentifier = fmt.Sprintf("%s-%s", info.Name, d.Name)
         info.Databases = append(info.Databases, d)
     }
     return nil

@@ -5,7 +5,6 @@ go 1.23.0
 toolchain go1.24.3
 
 require (
-	github.com/alexbrainman/sspi v0.0.0-20250919150558-7d374ff0d59e
 	github.com/go-ldap/ldap/v3 v3.4.12
 	github.com/microsoft/go-mssqldb v1.9.5
 )

@@ -11,12 +11,10 @@ type Graph struct {
 }
 
 type Node struct {
-	Id         string                 `json:"id"` // Ensure this is serialized as "objectid" if needed, but BH 4+ uses "id"?
-                                              // Checking PS1: Add-Node uses -Id, but the output JSON property is likely "data" with "objectid"?
-                                              // Wait, let's double check the PS1 output format.
+	Id         string                 `json:"id"`
 	Kinds      []string               `json:"kinds"`
 	Properties map[string]interface{} `json:"properties"`
-    Label      string                 `json:"label,omitempty"` // Sometimes used, but usually Kinds is enough
+    Label      string                 `json:"label,omitempty"`
 }
 
 type Edge struct {
@@ -78,21 +76,21 @@ type ServiceAccount struct {
 type ServerPrincipal struct {
 	Name                     string
 	PrincipalID              int
-	ObjectIdentifier         string // SID or other unique ID
-    SecurityIdentifier       string // SID
+	ObjectIdentifier         string
+    SecurityIdentifier       string
 	TypeDescription          string
-	IsDisabled               string // "1" or "0" in PS1
-    IsFixedRole              string // "1" or "0"
-	IsActiveDirectoryPrincipal string // "1" or "0"
+	IsDisabled               string
+    IsFixedRole              string
+	IsActiveDirectoryPrincipal string
 	CreateDate               string
 	ModifyDate               string
 	DefaultDatabaseName      string
     SQLServerName            string
     SQLServerID              string
-    OwningPrincipalID        int // For roles
+    OwningPrincipalID        int
     OwningObjectIdentifier   string
-	MemberOf                 []ServerPrincipal // Roles this principal is a member of
-    Members                  []string // Names of members
+	MemberOf                 []ServerPrincipal
+    Members                  []string
 	Permissions              []Permission
     HasCredential            *Credential
 }
@@ -100,7 +98,7 @@ type ServerPrincipal struct {
 type Database struct {
 	Name                      string
 	DatabaseID                int
-	ObjectIdentifier          string // usually generated
+	ObjectIdentifier          string
 	PrincipalID               int
 	OwnerLoginName            string
 	OwnerPrincipalID          int
@@ -117,17 +115,17 @@ type DatabasePrincipal struct {
 	ObjectIdentifier         string
     SecurityIdentifier       string
 	TypeDescription          string
-    IsFixedRole              string // "1" or "0"
+    IsFixedRole              string
 	CreateDate               string
 	ModifyDate               string
 	DefaultSchemaName        string
     SQLServerName            string
-	MemberOf                 []DatabasePrincipal // Roles this principal is a member of
-    Members                  []string // Names of members
+	MemberOf                 []DatabasePrincipal
+    Members                  []string
 	Permissions              []Permission
     OwningPrincipalID        int
     OwningObjectIdentifier   string
-    ServerLogin              *ServerPrincipal // Mapped login
+    ServerLogin              *ServerPrincipal
 }
 
 type Permission struct {
@@ -136,7 +134,7 @@ type Permission struct {
 	ClassDesc              string
 	SubEntityName          string
 	PermissionName         string
-    TargetObjectIdentifier string // Calculated target
+    TargetObjectIdentifier string
 }
 
 type LinkedServer struct {
@@ -176,10 +174,10 @@ type Credential struct {
     CreateDate         string
     ModifyDate         string
     IsDomainPrincipal  bool
-    ResolvedPrincipal  *ServiceAccount // Reusing ServiceAccount struct for generic resolved principal
+    ResolvedPrincipal  *ServiceAccount
     ResolvedSID        string
     ResolvedType       string
-    Database           string // For DB scoped credentials
+    Database           string
 }
 
 type ProxyAccount struct {
@@ -199,6 +197,6 @@ type ProxyAccount struct {
 }
 
 type LocalGroupInfo struct {
-    Principal *ServerPrincipal // Reusing ServerPrincipal to store group details
-    Members   []ServiceAccount // Reusing ServiceAccount for member details
+    Principal *ServerPrincipal
+    Members   []ServiceAccount
 }
