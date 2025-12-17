@@ -29,6 +29,7 @@ func main() {
     portThreads := flag.Int("port-scan-threads", 100, "Threads for port scanning")
     domain := flag.String("domain", "", "Domain name")
     dc := flag.String("dc", "", "Domain Controller")
+    debug := flag.Bool("debug", false, "Enable debug logging")
 	flag.Parse()
 
     // Determine Auth Type
@@ -75,7 +76,7 @@ func main() {
             log.Printf("Auto-discovered environment: Domain=%s, DC=%s", targetDomain, targetDC)
 
             // Pass explicit credentials if provided, otherwise empty strings trigger auto-auth attempt (SSPI/Anonymous)
-            session, err := discovery.NewSession(targetDC, targetDomain, *username, *password, false)
+            session, err := discovery.NewSession(targetDC, targetDomain, *username, *password, false, *debug)
             if err != nil {
                  log.Printf("LDAP connection failed (skipping AD enum): %v", err)
             } else {

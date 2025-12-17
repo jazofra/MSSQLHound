@@ -43,14 +43,19 @@ const (
     LDAP_VERSION3             = 3
     LDAP_OPT_REFERRALS        = 0x02
     LDAP_OPT_OFF              = 0
+    PAGE_SIZE                 = 500 // Reduced to 500 to test paging trigger
 )
 
 type WindowsDiscoverer struct {
 	ld     uintptr
 	domain string
+    debug  bool
 }
 
-func NewWindowsDiscoverer(domainController string, domain string) (*WindowsDiscoverer, error) {
+func NewWindowsDiscoverer(domainController string, domain string, debug bool) (*WindowsDiscoverer, error) {
+    if debug {
+        fmt.Printf("[DEBUG] Initializing Windows LDAP client for %s\n", domainController)
+    }
 	dcPtr, _ := syscall.UTF16PtrFromString(domainController)
 	ld, _, _ := ldap_init.Call(uintptr(unsafe.Pointer(dcPtr)), uintptr(LDAP_PORT))
 	if ld == 0 {
@@ -59,13 +64,19 @@ func NewWindowsDiscoverer(domainController string, domain string) (*WindowsDisco
 
     // Set LDAP v3
     version := uintptr(LDAP_VERSION3)
-    ldap_set_option.Call(ld, uintptr(LDAP_OPT_PROTOCOL_VERSION), uintptr(unsafe.Pointer(&version)))
+    ret, _, _ := ldap_set_option.Call(ld, uintptr(LDAP_OPT_PROTOCOL_VERSION), uintptr(unsafe.Pointer(&version)))
+    if debug {
+        fmt.Printf("[DEBUG] Set LDAPv3: ret=%d\n", ret)
+    }
 
     // Disable Referrals
     referrals := uintptr(LDAP_OPT_OFF)
-    ldap_set_option.Call(ld, uintptr(LDAP_OPT_REFERRALS), uintptr(unsafe.Pointer(&referrals)))
+    ret, _, _ = ldap_set_option.Call(ld, uintptr(LDAP_OPT_REFERRALS), uintptr(unsafe.Pointer(&referrals)))
+    if debug {
+        fmt.Printf("[DEBUG] Disable Referrals: ret=%d\n", ret)
+    }
 
-	ret, _, _ := ldap_connect.Call(ld, 0)
+	ret, _, _ = ldap_connect.Call(ld, 0)
 	if ret != LDAP_SUCCESS {
         ldap_unbind.Call(ld)
 		return nil, fmt.Errorf("ldap_connect failed: %d", ret)
@@ -76,8 +87,11 @@ func NewWindowsDiscoverer(domainController string, domain string) (*WindowsDisco
         ldap_unbind.Call(ld)
 		return nil, fmt.Errorf("ldap_bind_s (Negotiate) failed: %d. Ensure you are in a domain context.", ret)
 	}
+    if debug {
+        fmt.Printf("[DEBUG] Bind Successful\n")
+    }
 
-	return &WindowsDiscoverer{ld: ld, domain: domain}, nil
+	return &WindowsDiscoverer{ld: ld, domain: domain, debug: debug}, nil
 }
 
 func (w *WindowsDiscoverer) Close() {
@@ -100,6 +114,9 @@ func (w *WindowsDiscoverer) FindComputers() ([]string, error) {
 }
 
 func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error) {
+    if w.debug {
+        fmt.Printf("[DEBUG] Searching %s for %s\n", filter, attr)
+    }
     // Convert domain to DN
     parts := strings.Split(w.domain, ".")
     var dnParts []string
