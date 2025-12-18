@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/go-ldap/ldap/v3"
+    "github.com/SpecterOps/MSSQLHound/pkg/utils"
 )
 
 // LDAPSession manages the connection to Active Directory
@@ -121,6 +122,53 @@ func (s *LDAPSession) FindComputers() ([]string, error) {
         }
     }
     return computers, nil
+}
+
+func (s *LDAPSession) Resolve(name string) (string, string, string, error) {
+    // Basic LDAP implementation for Resolve
+    // Note: go-ldap returns objectSid as binary string in GetAttributeValue usually, or bytes.
+    // We need to parse it.
+
+    baseDN := s.domainToDN(s.Domain)
+    filter := fmt.Sprintf("(|(sAMAccountName=%s)(dNSHostName=%s)(name=%s))", name, name, name)
+    attributes := []string{"objectSid", "distinguishedName", "objectClass"}
+
+    searchRequest := ldap.NewSearchRequest(
+        baseDN,
+        ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
+        filter,
+        attributes,
+        nil,
+    )
+
+    sr, err := s.Conn.Search(searchRequest)
+    if err != nil {
+        return "", "", "", err
+    }
+
+    if len(sr.Entries) == 0 {
+        return "", "", "", fmt.Errorf("not found")
+    }
+
+    entry := sr.Entries[0]
+
+    // Get SID
+    sid := ""
+    sidBytes := entry.GetRawAttributeValue("objectSid")
+    if len(sidBytes) > 0 {
+        sid = utils.ConvertSidToSddl(sidBytes)
+    }
+
+    dn := entry.GetAttributeValue("distinguishedName")
+    classes := entry.GetAttributeValues("objectClass")
+    cls := "User"
+    for _, c := range classes {
+        if strings.ToLower(c) == "computer" {
+            cls = "Computer"
+        }
+    }
+
+    return sid, dn, cls, nil
 }
 
 func (s *LDAPSession) domainToDN(domain string) string {

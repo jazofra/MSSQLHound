@@ -16,9 +16,10 @@ type MSSQLCollector struct {
 	Host             string
 	Port             int
 	InstanceName     string
+    Resolver         models.PrincipalResolver
 }
 
-func NewMSSQLCollector(host string, port int, instance string, username string, password string, domain string, authType string) *MSSQLCollector {
+func NewMSSQLCollector(host string, port int, instance string, username string, password string, domain string, authType string, resolver models.PrincipalResolver) *MSSQLCollector {
 	// Build connection string
 	var connStr string
 	if authType == "Windows" {
@@ -44,6 +45,7 @@ func NewMSSQLCollector(host string, port int, instance string, username string, 
 		Host:             host,
 		Port:             port,
 		InstanceName:     instance,
+        Resolver:         resolver,
 	}
 }
 
@@ -67,8 +69,37 @@ func (c *MSSQLCollector) Collect(ctx context.Context) (*models.MSSQLServerInfo, 
 	if err := c.collectServerInfo(ctx, db, info); err != nil {
 		return nil, fmt.Errorf("collectServerInfo: %v", err)
 	}
+
+    // Resolve Server SID
+    serverSid := ""
+    if c.Resolver != nil {
+        // info.Name is @@SERVERNAME, might not match computer name if renamed.
+        // But collecting MachineName might require sys.dm_os_sys_info which we don't have perms for?
+        // We collected MachineName in QueryServerBasicInfo!
+        // We'll use MachineName first if available, else Host.
+
+        // Assuming we fix collectServerInfo to store it or we use Host.
+        // Try resolving Host$
+        sid, _, _, err := c.Resolver.Resolve(c.Host + "$")
+        if err == nil && sid != "" {
+            serverSid = sid
+        }
+    }
+
     // Set object identifier
-    info.ObjectIdentifier = fmt.Sprintf("%s:%d", info.Name, c.Port)
+    // Format: SID:InstanceName (if named) or SID:Port (if default?)
+    // PS1 uses SID:Port usually.
+    suffix := fmt.Sprintf("%d", c.Port)
+    if info.InstanceName != "" && info.InstanceName != "MSSQLSERVER" {
+        suffix = info.InstanceName
+    }
+
+    if serverSid != "" {
+        info.ObjectIdentifier = fmt.Sprintf("%s:%s", serverSid, suffix)
+    } else {
+        // Fallback
+        info.ObjectIdentifier = fmt.Sprintf("%s:%s", info.Name, suffix)
+    }
 
 	// 2. Server Principals (Best Effort)
 	if err := c.collectServerPrincipals(ctx, db, info); err != nil {
@@ -122,6 +153,7 @@ func (c *MSSQLCollector) collectServerInfo(ctx context.Context, db *sql.DB, info
     }
 
     info.Name = serverName
+    info.InstanceName = instanceName // Ensure we capture instance name
     info.Version = prodVer
     info.IsMixedModeAuthEnabled = (authMode == "SQL Server and Windows Authentication")
 
@@ -181,8 +213,13 @@ func (c *MSSQLCollector) collectServerPrincipals(ctx context.Context, db *sql.DB
 		}
 
         sddl := utils.ConvertSidToSddl(sid)
-        p.ObjectIdentifier = sddl
-        p.SecurityIdentifier = sddl
+        if sddl != "" {
+            p.ObjectIdentifier = sddl
+            p.SecurityIdentifier = sddl
+        } else {
+            // SQL Login or unresolved
+            p.ObjectIdentifier = fmt.Sprintf("%s@%s", p.Name, info.ObjectIdentifier)
+        }
 
         p.CreateDate = createDate.String
         p.ModifyDate = modifyDate.String

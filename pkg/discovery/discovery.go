@@ -4,6 +4,7 @@ package discovery
 type Discoverer interface {
 	FindMSSQLSPNs() ([]string, error)
 	FindComputers() ([]string, error)
+    Resolve(name string) (string, string, string, error)
 	Close()
 }
 

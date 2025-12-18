@@ -7,6 +7,7 @@ import (
     "strings"
 	"syscall"
 	"unsafe"
+    "github.com/SpecterOps/MSSQLHound/pkg/utils"
 )
 
 var (
@@ -24,7 +25,9 @@ var (
     ldap_first_entry = wldap32.NewProc("ldap_first_entry")
     ldap_next_entry  = wldap32.NewProc("ldap_next_entry")
     ldap_get_values  = wldap32.NewProc("ldap_get_valuesW")
+    ldap_get_values_len = wldap32.NewProc("ldap_get_values_lenW")
     ldap_value_free  = wldap32.NewProc("ldap_value_freeW")
+    ldap_value_free_len = wldap32.NewProc("ldap_value_free_len")
     ldap_set_option    = wldap32.NewProc("ldap_set_optionW")
 )
 
@@ -108,6 +111,125 @@ func (w *WindowsDiscoverer) FindComputers() ([]string, error) {
     filter := "(&(objectClass=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))"
     attr := "dNSHostName"
     return w.search(filter, attr)
+}
+
+func (w *WindowsDiscoverer) Resolve(name string) (string, string, string, error) {
+    // Search for user or computer with sAMAccountName
+    filter := fmt.Sprintf("(|(sAMAccountName=%s)(dNSHostName=%s)(name=%s))", name, name, name)
+    // We need objectSid, distinguishedName, objectClass
+    // wldap32 returns binary SID for objectSid? Yes.
+    // NOTE: This requires expanding search() to return attributes, not just strings.
+    // For now, I'll stick to a simpler implementation or refactor search.
+    // Since search() is hardcoded for single attr, I'll write a specific resolveSearch.
+    return w.resolveSearch(filter)
+}
+
+func (w *WindowsDiscoverer) resolveSearch(filter string) (string, string, string, error) {
+    // Convert domain to DN (reused)
+    parts := strings.Split(w.domain, ".")
+    var dnParts []string
+    for _, part := range parts {
+        dnParts = append(dnParts, "DC="+part)
+    }
+    baseDN := strings.Join(dnParts, ",")
+
+    basePtr, _ := syscall.UTF16PtrFromString(baseDN)
+    filterPtr, _ := syscall.UTF16PtrFromString(filter)
+
+    // Attributes: objectSid, distinguishedName, objectClass
+    attrSid, _ := syscall.UTF16PtrFromString("objectSid")
+    attrDn, _ := syscall.UTF16PtrFromString("distinguishedName")
+    attrClass, _ := syscall.UTF16PtrFromString("objectClass")
+
+    var attrs []*uint16
+    attrs = append(attrs, attrSid, attrDn, attrClass, nil)
+    attrsPtr := uintptr(unsafe.Pointer(&attrs[0]))
+
+    var res uintptr
+    // Standard search, no paging needed for single object
+    ret, _, _ := ldap_search_s.Call(
+        w.ld,
+        uintptr(unsafe.Pointer(basePtr)),
+        uintptr(LDAP_SCOPE_SUBTREE),
+        uintptr(unsafe.Pointer(filterPtr)),
+        attrsPtr,
+        0,
+        uintptr(unsafe.Pointer(&res)),
+    )
+
+    if ret != LDAP_SUCCESS {
+        return "", "", "", fmt.Errorf("resolve failed: %d", ret)
+    }
+    defer ldap_msgfree.Call(res)
+
+    entry, _, _ := ldap_first_entry.Call(w.ld, res)
+    if entry == 0 {
+        return "", "", "", fmt.Errorf("not found")
+    }
+
+    // Get DN
+    valsPtr, _, _ := ldap_get_values.Call(w.ld, entry, uintptr(unsafe.Pointer(attrDn)))
+    dn := ""
+    if valsPtr != 0 {
+        valPtr := *(*uintptr)(unsafe.Pointer(valsPtr))
+        if valPtr != 0 {
+            dn = syscall.UTF16ToString((*[1 << 30]uint16)(unsafe.Pointer(valPtr))[:])
+        }
+        ldap_value_free.Call(valsPtr)
+    }
+
+    // Get Class
+    valsPtr, _, _ = ldap_get_values.Call(w.ld, entry, uintptr(unsafe.Pointer(attrClass)))
+    cls := "User" // Default
+    if valsPtr != 0 {
+        // iterate to find computer
+        p := valsPtr
+        for {
+            valPtr := *(*uintptr)(unsafe.Pointer(p))
+            if valPtr == 0 { break }
+            v := syscall.UTF16ToString((*[1 << 30]uint16)(unsafe.Pointer(valPtr))[:])
+            if strings.ToLower(v) == "computer" {
+                cls = "Computer"
+            }
+            p += unsafe.Sizeof(uintptr(0))
+        }
+        ldap_value_free.Call(valsPtr)
+    }
+
+    // Get SID (Binary) - use ldap_get_values_len
+    sid := ""
+    valsPtr, _, _ = ldap_get_values_len.Call(w.ld, entry, uintptr(unsafe.Pointer(attrSid)))
+    if valsPtr != 0 {
+        // valsPtr is **BERVAL (null terminated array of pointers to BERVAL)
+        // struct berval { ULONG bv_len; PCHAR bv_val; }
+
+        // We only expect one SID
+        valPtr := *(*uintptr)(unsafe.Pointer(valsPtr))
+        if valPtr != 0 {
+            // Read length
+            bvLen := *(*uint32)(unsafe.Pointer(valPtr))
+            // Read pointer to data
+            // bvVal is at offset 4 or 8 depending on arch. ULONG is 32-bit.
+            // Alignment: PCHAR is 8 bytes.
+            // On x64: 4 bytes len, 4 bytes padding, 8 bytes ptr.
+            bvValPtr := *(*uintptr)(unsafe.Pointer(valPtr + 8))
+
+            // Copy data
+            if bvValPtr != 0 {
+                data := make([]byte, bvLen)
+                // memcpy equivalent
+                for i := uint32(0); i < bvLen; i++ {
+                    data[i] = *(*byte)(unsafe.Pointer(bvValPtr + uintptr(i)))
+                }
+
+                // Convert SID to SDDL
+                sid = utils.ConvertSidToSddl(data)
+            }
+        }
+        ldap_value_free_len.Call(valsPtr)
+    }
+
+    return sid, dn, cls, nil
 }
 
 func (w *WindowsDiscoverer) search(filter string, attr string) ([]string, error) {

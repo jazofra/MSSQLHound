@@ -44,6 +44,7 @@ func main() {
 	log.Printf("Starting MSSQLHound (Go Port)... Auth Mode: %s", finalAuthType)
 
 	var targets []string
+    var resolver models.PrincipalResolver
 
     // 1. Target Discovery
 	if *serverInstance != "" {
@@ -80,6 +81,8 @@ func main() {
             if err != nil {
                  log.Printf("LDAP connection failed (skipping AD enum): %v", err)
             } else {
+            // Assign resolver
+            resolver = session
             defer session.Close()
             spns, err := session.FindMSSQLSPNs()
             if err == nil {
@@ -142,7 +145,11 @@ func main() {
                      dom = os.Getenv("USERDOMAIN")
                 }
 
-                col := collector.NewMSSQLCollector(host, port, instance, *username, *password, dom, finalAuthType)
+                // If we have a discovery session, it implements Resolver.
+                // We need to pass it.
+                // resolver variable is set above.
+
+                col := collector.NewMSSQLCollector(host, port, instance, *username, *password, dom, finalAuthType, resolver)
                 info, err := col.Collect(context.Background())
                 if err != nil {
                     log.Printf("Failed to collect from %s: %v", tgt, err)
