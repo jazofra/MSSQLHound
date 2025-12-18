@@ -29,6 +29,9 @@ type Edge struct {
 type MSSQLServerInfo struct {
 	Name                                    string
 	ObjectIdentifier                        string
+    HostSID                                 string
+    HostDN                                  string
+    HostName                                string
 	InstanceName                            string
     Port                                    int
 	Version                                 string

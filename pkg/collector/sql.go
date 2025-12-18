@@ -49,57 +49,72 @@ func NewMSSQLCollector(host string, port int, instance string, username string, 
 	}
 }
 
-func (c *MSSQLCollector) Collect(ctx context.Context) (*models.MSSQLServerInfo, error) {
+// BuildStubInfo attempts to resolve the host to a SID and create a basic info object
+// regardless of whether we can connect to the SQL instance.
+func (c *MSSQLCollector) BuildStubInfo(ctx context.Context) *models.MSSQLServerInfo {
+    info := &models.MSSQLServerInfo{
+        Name:         c.Host, // Default to host
+        InstanceName: c.InstanceName,
+        Port:         c.Port,
+    }
+
+    // Try to resolve host SID (Computer Account)
+    if c.Resolver != nil {
+        // Append $ to search for computer account
+        hostToResolve := c.Host
+        if !strings.HasSuffix(hostToResolve, "$") {
+             // Basic heuristic: assume computer account
+             // But if it's an IP, this will fail gracefully
+             // If it is a FQDN, we extract the shortname?
+             // Resolver handles FQDN/Shortname.
+             hostToResolve += "$"
+        }
+
+        sid, dn, cls, err := c.Resolver.Resolve(hostToResolve)
+        if err == nil && sid != "" && strings.EqualFold(cls, "computer") {
+            info.HostSID = sid
+            info.HostDN = dn
+            info.HostName = c.Host // Or extract from DN
+        }
+    }
+
+    // Set object identifier based on best available info
+    // Format: SID:InstanceName (if named) or SID:Port (if default)
+    suffix := fmt.Sprintf("%d", c.Port)
+    if info.InstanceName != "" && info.InstanceName != "MSSQLSERVER" {
+        suffix = strings.ToUpper(info.InstanceName)
+    }
+
+    if info.HostSID != "" {
+        info.ObjectIdentifier = fmt.Sprintf("%s:%s", info.HostSID, suffix)
+    } else {
+        // Fallback to HOST:PORT if no SID resolved (e.g. IP address or offline)
+        info.ObjectIdentifier = fmt.Sprintf("%s:%s", strings.ToUpper(c.Host), suffix)
+    }
+
+    return info
+}
+
+func (c *MSSQLCollector) Collect(ctx context.Context, info *models.MSSQLServerInfo) error {
 	db, err := sql.Open("sqlserver", c.ConnectionString)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open connection: %v", err)
+		return fmt.Errorf("failed to open connection: %v", err)
 	}
 	defer db.Close()
 
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("failed to connect to server %s: %v", c.Host, err)
+		return fmt.Errorf("failed to connect to server %s: %v", c.Host, err)
 	}
 
-	info := &models.MSSQLServerInfo{
-		InstanceName: c.InstanceName,
-		Port:         c.Port,
-	}
-
-	// 1. Server Info (Critical)
+	// 1. Server Info (Critical - overwrites Stub if successful)
 	if err := c.collectServerInfo(ctx, db, info); err != nil {
-		return nil, fmt.Errorf("collectServerInfo: %v", err)
+		return fmt.Errorf("collectServerInfo: %v", err)
 	}
 
-    // Resolve Server SID
-    serverSid := ""
-    if c.Resolver != nil {
-        // info.Name is @@SERVERNAME, might not match computer name if renamed.
-        // But collecting MachineName might require sys.dm_os_sys_info which we don't have perms for?
-        // We collected MachineName in QueryServerBasicInfo!
-        // We'll use MachineName first if available, else Host.
-
-        // Assuming we fix collectServerInfo to store it or we use Host.
-        // Try resolving Host$
-        sid, _, _, err := c.Resolver.Resolve(c.Host + "$")
-        if err == nil && sid != "" {
-            serverSid = sid
-        }
-    }
-
-    // Set object identifier
-    // Format: SID:InstanceName (if named) or SID:Port (if default?)
-    // PS1 uses SID:Port usually.
-    suffix := fmt.Sprintf("%d", c.Port)
-    if info.InstanceName != "" && info.InstanceName != "MSSQLSERVER" {
-        suffix = info.InstanceName
-    }
-
-    if serverSid != "" {
-        info.ObjectIdentifier = fmt.Sprintf("%s:%s", serverSid, suffix)
-    } else {
-        // Fallback
-        info.ObjectIdentifier = fmt.Sprintf("%s:%s", info.Name, suffix)
-    }
+    // Re-evaluate ObjectIdentifier if we got a real @@SERVERNAME but NO HostSID?
+    // Actually, stick to HostSID if we have it.
+    // If we didn't have HostSID before, maybe we can get it now via SQL? (unlikely without xp_cmdshell)
+    // So we keep the one from BuildStubInfo.
 
 	// 2. Server Principals (Best Effort)
 	if err := c.collectServerPrincipals(ctx, db, info); err != nil {
@@ -134,7 +149,7 @@ func (c *MSSQLCollector) Collect(ctx context.Context) (*models.MSSQLServerInfo, 
         // Warning
     }
 
-	return info, nil
+	return nil
 }
 
 func (c *MSSQLCollector) collectServerInfo(ctx context.Context, db *sql.DB, info *models.MSSQLServerInfo) error {

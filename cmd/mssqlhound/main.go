@@ -150,14 +150,21 @@ func main() {
                 // resolver variable is set above.
 
                 col := collector.NewMSSQLCollector(host, port, instance, *username, *password, dom, finalAuthType, resolver)
-                info, err := col.Collect(context.Background())
+
+                // Always start with a Stub info (Host Resolution)
+                info := col.BuildStubInfo(context.Background())
+
+                // Attempt collection
+                err := col.Collect(context.Background(), info)
                 if err != nil {
-                    log.Printf("Failed to collect from %s: %v", tgt, err)
-                    resultsChan <- nil
+                    log.Printf("Failed to fully collect from %s: %v (Creating partial node)", tgt, err)
+                    // We still send the info if we have at least a name
                 } else {
-                    resultsChan <- info
                     log.Printf("Successfully collected from %s", tgt)
                 }
+
+                // Send what we have
+                resultsChan <- info
             }
         }()
     }

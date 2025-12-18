@@ -24,6 +24,9 @@ func NewConverter() *Converter {
 
 // Convert processes a single server info object and appends to the graph
 func (c *Converter) Convert(server *models.MSSQLServerInfo) {
+    // 0. Create Host Node (Computer) and Link to Server
+    c.addHostNode(server)
+
 	// 1. Create Server Node
 	c.addServerNode(server)
 
@@ -56,6 +59,34 @@ func (c *Converter) Convert(server *models.MSSQLServerInfo) {
     for _, db := range server.Databases {
         c.processDatabasePermissions(server, &db)
         c.processTrustworthy(server, &db)
+    }
+}
+
+func (c *Converter) addHostNode(server *models.MSSQLServerInfo) {
+    if server.HostSID != "" {
+        // Create Computer Node
+        c.Output.Graph.Nodes = append(c.Output.Graph.Nodes, models.Node{
+            Id: server.HostSID,
+            Kinds: []string{"Computer", "Base"},
+            Properties: map[string]interface{}{
+                "name": server.HostName,
+                "distinguishedname": server.HostDN,
+                "objectid": server.HostSID,
+            },
+            Label: server.HostName,
+        })
+
+        // MSSQL_HostFor: Host -> Server
+        c.Output.Graph.Edges = append(c.Output.Graph.Edges, models.Edge{
+            Source: server.HostSID,
+            Target: server.ObjectIdentifier,
+            Kind: "MSSQL_HostFor",
+        })
+
+        // MSSQL_ExecuteOnHost: Server -> Host (Implicitly true for server instance)
+        // Note: PS1 creates MSSQL_ExecuteOnHost? No, typically it's specific perms.
+        // But the relationship implies code execution possibility.
+        // Standard model: MSSQL_HostFor.
     }
 }
 
