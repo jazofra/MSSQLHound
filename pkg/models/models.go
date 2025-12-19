@@ -18,10 +18,14 @@ type Node struct {
 }
 
 type Edge struct {
-	Source     string                 `json:"source"`
-	Target     string                 `json:"target"`
+	Start      EdgeEndpoint           `json:"start"`
+	End        EdgeEndpoint           `json:"end"`
 	Kind       string                 `json:"kind"`
-	Properties map[string]interface{} `json:"properties"`
+	Properties map[string]interface{} `json:"properties,omitempty"`
+}
+
+type EdgeEndpoint struct {
+	Value string `json:"value"`
 }
 
 // Internal MSSQL Data Models
