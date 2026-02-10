@@ -22,6 +22,7 @@ type ServerInfo struct {
 	IsClustered           bool                       `json:"isClustered"`
 	IsMixedModeAuth       bool                       `json:"isMixedModeAuth"`
 	ForceEncryption       string                     `json:"forceEncryption,omitempty"`
+	StrictEncryption      string                     `json:"strictEncryption,omitempty"`
 	ExtendedProtection    string                     `json:"extendedProtection,omitempty"`
 	ComputerSID           string                     `json:"computerSID"`
 	DomainSID             string                     `json:"domainSID"`

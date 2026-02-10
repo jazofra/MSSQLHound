@@ -60,6 +60,9 @@ const (
 	encryptOn     byte = 0x01
 	encryptNotSup byte = 0x02
 	encryptReq    byte = 0x03
+	// encryptStrict is a synthetic value used to indicate TDS 8.0 strict
+	// encryption was detected (the server required TLS before any TDS messages).
+	encryptStrict byte = 0x08
 )
 
 // runEPATest performs a single raw TDS+TLS+NTLM login with the specified EPA test mode.
@@ -583,6 +586,154 @@ func parseErrorToken(data []byte) string {
 		runes[i] = binary.LittleEndian.Uint16(msgBytes[i*2 : i*2+2])
 	}
 	return string(utf16.Decode(runes))
+}
+
+// runEPATestStrict performs an EPA test using the TDS 8.0 strict encryption flow.
+// In TDS 8.0, TLS is established directly on the TCP socket before any TDS messages
+// (like HTTPS), so PRELOGIN and all subsequent packets are sent through TLS.
+// This is used when the server has "Enforce Strict Encryption" enabled and rejects
+// cleartext PRELOGIN packets.
+func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, error) {
+	logf := func(format string, args ...interface{}) {
+		if config.Verbose {
+			fmt.Printf("    [EPA-debug] "+format+"\n", args...)
+		}
+	}
+
+	testModeNames := map[EPATestMode]string{
+		EPATestNormal:         "Normal",
+		EPATestBogusCBT:       "BogusCBT",
+		EPATestMissingCBT:     "MissingCBT",
+		EPATestBogusService:   "BogusService",
+		EPATestMissingService: "MissingService",
+	}
+
+	port := config.Port
+	if port == 0 {
+		port = 1433
+	}
+
+	logf("Starting EPA test mode=%s (TDS 8.0 strict) against %s:%d", testModeNames[config.TestMode], config.Hostname, port)
+
+	// TCP connect
+	addr := fmt.Sprintf("%s:%d", config.Hostname, port)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("TCP connect to %s failed: %w", addr, err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	// Step 1: TLS handshake directly on TCP (TDS 8.0 strict)
+	// Unlike TDS 7.x where TLS records are wrapped in TDS PRELOGIN packets,
+	// TDS 8.0 does a standard TLS handshake on the raw socket.
+	tlsConn, err := performDirectTLSHandshake(conn, config.Hostname)
+	if err != nil {
+		return nil, fmt.Errorf("TLS handshake (strict): %w", err)
+	}
+	logf("TLS handshake complete (strict mode), cipher: 0x%04X", tlsConn.ConnectionState().CipherSuite)
+
+	// Step 2: Compute channel binding hash from TLS certificate
+	cbtHash, err := getChannelBindingHashFromTLS(tlsConn)
+	if err != nil {
+		return nil, fmt.Errorf("compute CBT: %w", err)
+	}
+	logf("CBT hash: %x", cbtHash)
+
+	// Step 3: Send PRELOGIN through TLS (in strict mode, all TDS traffic is inside TLS)
+	preloginPayload := buildPreloginPacket()
+	preloginTDS := buildTDSPacketRaw(tdsPacketPrelogin, preloginPayload)
+	if _, err := tlsConn.Write(preloginTDS); err != nil {
+		return nil, fmt.Errorf("send PRELOGIN (strict): %w", err)
+	}
+
+	preloginResp, err := readTLSTDSPacket(tlsConn)
+	if err != nil {
+		return nil, fmt.Errorf("read PRELOGIN response (strict): %w", err)
+	}
+
+	encryptionFlag, err := parsePreloginEncryption(preloginResp)
+	if err != nil {
+		logf("Could not parse encryption flag from strict PRELOGIN response: %v (continuing)", err)
+	} else {
+		logf("Server encryption flag (strict): 0x%02X", encryptionFlag)
+	}
+
+	// Step 4: Setup NTLM authenticator
+	spn := computeSPN(config.Hostname, port)
+	auth := newNTLMAuth(config.Domain, config.Username, config.Password, spn)
+	auth.SetEPATestMode(config.TestMode)
+	auth.SetChannelBindingHash(cbtHash)
+	logf("SPN: %s, Domain: %s, User: %s", spn, config.Domain, config.Username)
+
+	negotiateMsg := auth.CreateNegotiateMessage()
+	logf("Type1 negotiate message: %d bytes", len(negotiateMsg))
+
+	// Step 5: Build and send LOGIN7 with NTLM Type1 through TLS
+	login7 := buildLogin7Packet(config.Hostname, "MSSQLHound-EPA", config.Hostname, negotiateMsg)
+	login7TDS := buildTDSPacketRaw(tdsPacketLogin7, login7)
+	if _, err := tlsConn.Write(login7TDS); err != nil {
+		return nil, fmt.Errorf("send LOGIN7 (strict): %w", err)
+	}
+	logf("Sent LOGIN7 (%d bytes with TDS header) (strict)", len(login7TDS))
+
+	// Step 6: Read server response (NTLM Type2 challenge) - always through TLS
+	responseData, err := readTLSTDSPacket(tlsConn)
+	if err != nil {
+		return nil, fmt.Errorf("read challenge response (strict): %w", err)
+	}
+	logf("Received challenge response: %d bytes", len(responseData))
+
+	// Extract NTLM Type2 from SSPI token
+	challengeData := extractSSPIToken(responseData)
+	if challengeData == nil {
+		success, errMsg := parseLoginTokens(responseData)
+		logf("No SSPI token found, login result: success=%v, error=%q", success, errMsg)
+		return &epaTestOutcome{
+			Success:           success,
+			ErrorMessage:      errMsg,
+			IsUntrustedDomain: strings.Contains(errMsg, "untrusted domain"),
+			IsLoginFailed:     strings.Contains(errMsg, "Login failed"),
+		}, nil
+	}
+	logf("Extracted NTLM Type2 challenge: %d bytes", len(challengeData))
+
+	// Step 7: Process challenge and generate Type3
+	if err := auth.ProcessChallenge(challengeData); err != nil {
+		return nil, fmt.Errorf("process NTLM challenge: %w", err)
+	}
+	logf("Server NetBIOS domain from Type2: %q (user-provided: %q)", auth.serverDomain, config.Domain)
+
+	authenticateMsg, err := auth.CreateAuthenticateMessage()
+	if err != nil {
+		return nil, fmt.Errorf("create NTLM authenticate: %w", err)
+	}
+	logf("Type3 authenticate message: %d bytes (mode=%s)", len(authenticateMsg), testModeNames[config.TestMode])
+
+	// Step 8: Send Type3 as TDS_SSPI through TLS
+	sspiTDS := buildTDSPacketRaw(tdsPacketSSPI, authenticateMsg)
+	if _, err := tlsConn.Write(sspiTDS); err != nil {
+		return nil, fmt.Errorf("send SSPI auth (strict): %w", err)
+	}
+	logf("Sent Type3 SSPI (%d bytes with TDS header) (strict)", len(sspiTDS))
+
+	// Step 9: Read final response through TLS
+	responseData, err = readTLSTDSPacket(tlsConn)
+	if err != nil {
+		return nil, fmt.Errorf("read auth response (strict): %w", err)
+	}
+	logf("Received auth response: %d bytes", len(responseData))
+
+	// Parse for LOGINACK or ERROR
+	success, errMsg := parseLoginTokens(responseData)
+	logf("Login result: success=%v, error=%q", success, errMsg)
+	return &epaTestOutcome{
+		Success:           success,
+		ErrorMessage:      errMsg,
+		IsUntrustedDomain: strings.Contains(errMsg, "untrusted domain"),
+		IsLoginFailed:     strings.Contains(errMsg, "Login failed"),
+	}, nil
 }
 
 // readTLSTDSPacket reads a complete TDS packet through TLS.

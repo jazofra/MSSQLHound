@@ -191,3 +191,24 @@ func performTLSHandshake(tds *tdsConn, serverName string) (*tls.Conn, *switchabl
 
 	return tlsConn, sw, nil
 }
+
+// performDirectTLSHandshake establishes TLS directly on the TCP connection
+// for TDS 8.0 strict encryption mode. Unlike performTLSHandshake which wraps
+// TLS records inside TDS PRELOGIN packets, this does a standard TLS handshake
+// on the raw socket (like HTTPS). All subsequent TDS messages are sent through
+// the TLS connection.
+func performDirectTLSHandshake(conn net.Conn, serverName string) (*tls.Conn, error) {
+	tlsConfig := &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: true, //nolint:gosec // EPA testing requires connecting to any server
+		// Disable dynamic record sizing for TDS compatibility
+		DynamicRecordSizingDisabled: true,
+	}
+
+	tlsConn := tls.Client(conn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, fmt.Errorf("TLS handshake failed: %w", err)
+	}
+
+	return tlsConn, nil
+}

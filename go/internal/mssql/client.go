@@ -14,7 +14,8 @@ import (
 	"time"
 
 	"github.com/SpecterOps/MSSQLHound/internal/types"
-	_ "github.com/microsoft/go-mssqldb" // registers "sqlserver" driver
+	mssqldb "github.com/microsoft/go-mssqldb"
+	"github.com/microsoft/go-mssqldb/msdsn"
 )
 
 // convertHexSIDToString converts a hex SID (like "0x0105000000...") to standard SID format (like "S-1-5-21-...")
@@ -205,12 +206,15 @@ func (c *Client) connectNative(ctx context.Context) error {
 	strategies := []connStrategy{
 		// Try FQDN with encryption (most common)
 		{"FQDN+encrypt", c.hostname, "true", false, ""},
+		// Try TDS 8.0 strict encryption (for servers enforcing strict)
+		{"FQDN+strict", c.hostname, "strict", false, ""},
 		// Try with explicit SPN
 		{"FQDN+encrypt+SPN", c.hostname, "true", true, c.hostname},
 		// Try without encryption
 		{"FQDN+no-encrypt", c.hostname, "false", false, ""},
 		// Try short hostname
 		{"short+encrypt", shortHostname, "true", false, ""},
+		{"short+strict", shortHostname, "strict", false, ""},
 		{"short+no-encrypt", shortHostname, "false", false, ""},
 	}
 
@@ -219,7 +223,17 @@ func (c *Client) connectNative(ctx context.Context) error {
 		connStr := c.buildConnectionStringForStrategy(strategy.serverName, strategy.encrypt, strategy.useServerSPN, strategy.spnHost)
 		c.logVerbose("Trying connection strategy '%s': %s", strategy.name, connStr)
 
-		db, err := sql.Open("sqlserver", connStr)
+		var db *sql.DB
+		var err error
+
+		if strategy.encrypt == "strict" {
+			// For strict encryption (TDS 8.0), go-mssqldb forces certificate
+			// validation regardless of TrustServerCertificate. Use NewConnectorConfig
+			// to override TLS settings so we can connect to servers with self-signed certs.
+			db, err = openStrictDB(connStr)
+		} else {
+			db, err = sql.Open("sqlserver", connStr)
+		}
 		if err != nil {
 			lastErr = err
 			c.logVerbose("  Strategy '%s' failed to open: %v", strategy.name, err)
@@ -244,6 +258,21 @@ func (c *Client) connectNative(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("all connection strategies failed, last error: %w", lastErr)
+}
+
+// openStrictDB creates a *sql.DB for TDS 8.0 strict encryption with certificate
+// validation disabled. go-mssqldb forces TrustServerCertificate=false in strict
+// mode, so we parse the config and override InsecureSkipVerify via NewConnectorConfig.
+func openStrictDB(connStr string) (*sql.DB, error) {
+	config, err := msdsn.Parse(connStr)
+	if err != nil {
+		return nil, err
+	}
+	if config.TLSConfig != nil {
+		config.TLSConfig.InsecureSkipVerify = true //nolint:gosec // security tool needs to connect to any server
+	}
+	connector := mssqldb.NewConnectorConfig(config)
+	return sql.OpenDB(connector), nil
 }
 
 // connectPowerShell connects using PowerShell and System.Data.SqlClient
@@ -425,6 +454,7 @@ type EPATestResult struct {
 	NoSBSuccess       bool
 	NoCBTSuccess      bool
 	ForceEncryption   bool
+	StrictEncryption  bool
 	EncryptionFlag    byte
 	EPAStatus         string
 }
@@ -477,11 +507,29 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 		}
 	}
 
-	// Step 1: Prerequisite check - normal login must produce expected result
+	// Step 1: Detect encryption mode and run prerequisite check
 	c.logVerbose("  Running prerequisite check with normal login...")
 	prereqResult, encFlag, err := runEPATest(ctx, baseConfig(EPATestNormal))
 	if err != nil {
-		return nil, fmt.Errorf("EPA prereq check failed: %w", err)
+		// The normal TDS 7.x PRELOGIN failed. This may indicate the server
+		// enforces TDS 8.0 strict encryption (TLS before any TDS messages).
+		c.logVerbose("  Normal PRELOGIN failed (%v), trying TDS 8.0 strict encryption flow...", err)
+		_, strictErr := runEPATestStrict(ctx, baseConfig(EPATestNormal))
+		if strictErr != nil {
+			return nil, fmt.Errorf("EPA prereq check failed (tried normal and TDS 8.0 strict): normal=%w, strict=%v", err, strictErr)
+		}
+		// TDS 8.0 strict encryption confirmed.
+		// In strict mode we cannot determine Force Encryption or EPA enforcement
+		// via NTLM AV_PAIR manipulation — additional research is required.
+		result.EncryptionFlag = encryptStrict
+		result.StrictEncryption = true
+		result.EPAStatus = "Unknown"
+		c.logVerbose("  Server uses TDS 8.0 strict encryption")
+		c.logVerbose("  Encryption flag: 0x%02X", encryptStrict)
+		c.logVerbose("  Strict Encryption (TDS 8.0): Yes")
+		c.logVerbose("  Force Encryption: No")
+		c.logVerbose("  Extended Protection: Force Strict Encryption without Force Encryption requires additional research to determine (Off/Allowed/Required)")
+		return result, nil
 	}
 
 	result.EncryptionFlag = encFlag
@@ -2283,6 +2331,11 @@ func (c *Client) collectEncryptionSettings(ctx context.Context, info *types.Serv
 				info.ForceEncryption = "Yes"
 			} else {
 				info.ForceEncryption = "No"
+			}
+			if epaResult.StrictEncryption {
+				info.StrictEncryption = "Yes"
+			} else {
+				info.StrictEncryption = "No"
 			}
 			info.ExtendedProtection = epaResult.EPAStatus
 			return nil
