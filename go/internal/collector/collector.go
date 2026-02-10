@@ -33,6 +33,8 @@ type Config struct {
 	Password         string
 	Domain           string
 	DomainController string
+	DCIP             string // Domain controller IP address
+	DNSResolver      string // DNS resolver to use for lookups
 	LDAPUser         string
 	LDAPPassword     string
 
@@ -101,6 +103,18 @@ func New(config *Config) *Collector {
 		config:        config,
 		serverSPNData: make(map[string]*ServerSPNInfo),
 	}
+}
+
+// getDNSResolver returns the DNS resolver to use, applying the logic:
+// if --dc-ip is specified but --dns-resolver is not, use dc-ip as the resolver
+func (c *Collector) getDNSResolver() string {
+	if c.config.DNSResolver != "" {
+		return c.config.DNSResolver
+	}
+	if c.config.DCIP != "" {
+		return c.config.DCIP
+	}
+	return ""
 }
 
 // Run executes the collection process
@@ -455,7 +469,7 @@ func (c *Collector) tryResolveSID(server *ServerToProcess) {
 	}
 
 	// Try LDAP
-	adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+	adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 	defer adClient.Close()
 
 	sid, err := adClient.ResolveComputerSID(server.Hostname)
@@ -508,7 +522,7 @@ func (c *Collector) detectDomain() string {
 // enumerateServersFromAD discovers MSSQL servers from Active Directory SPNs
 func (c *Collector) enumerateServersFromAD() error {
 	// First try native Go LDAP
-	adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+	adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 
 	spns, err := adClient.EnumerateMSSQLSPNs()
 	adClient.Close()
@@ -579,7 +593,7 @@ func (c *Collector) enumerateServersFromAD() error {
 	// If ScanAllComputers is enabled, also enumerate all domain computers
 	if c.config.ScanAllComputers {
 		fmt.Println("ScanAllComputers enabled, enumerating all domain computers...")
-		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 		defer adClient.Close()
 
 		computers, err := adClient.EnumerateAllComputers()
@@ -975,7 +989,7 @@ func (c *Collector) lookupSPNsForServer(server *ServerToProcess) *ServerSPNInfo 
 	fmt.Printf("  Looking up SPNs for %s in AD (domain: %s)\n", server.Hostname, domain)
 
 	// Try native LDAP first
-	adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+	adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 	spns, err := adClient.LookupMSSQLSPNsForHost(server.Hostname)
 	adClient.Close()
 
@@ -1183,7 +1197,7 @@ func (c *Collector) resolveComputerSIDViaLDAP(serverInfo *types.ServerInfo) {
 	c.logVerbose("  Method 3: LDAP query")
 
 	// Create AD client
-	adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+	adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 	defer adClient.Close()
 
 	sid, err = adClient.ResolveComputerSID(machineName)
@@ -1388,7 +1402,7 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 
 			// For other computer accounts, try LDAP
 			if c.config.Domain != "" {
-				adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+				adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 				principal, err := adClient.ResolveSID(sa.SID)
 				adClient.Close()
 				if err == nil && principal != nil && principal.ObjectClass == "computer" {
@@ -1410,7 +1424,7 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 			}
 
 			// Create AD client
-			adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+			adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 			principal, err := adClient.ResolveName(sa.Name)
 			adClient.Close()
 			if err != nil {
@@ -1558,7 +1572,7 @@ func (c *Collector) enumerateLocalGroupMembers(serverInfo *types.ServerInfo) {
 
 			// Fall back to LDAP if Windows API didn't work and we have a domain
 			if lm.SID == "" && c.config.Domain != "" {
-				adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+				adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 				resolved, err := adClient.ResolveName(fullName)
 				adClient.Close()
 				if err == nil && resolved.SID != "" {
@@ -3531,7 +3545,7 @@ func (c *Collector) resolveDataSourceToSID(hostname, port, instanceName, domain 
 
 	// Try LDAP if domain is specified and Windows API failed
 	if domain != "" {
-		adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+		adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 		defer adClient.Close()
 
 		sid, err = adClient.ResolveComputerSID(machineName)
