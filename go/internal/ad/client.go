@@ -2,6 +2,7 @@
 package ad
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -22,6 +23,8 @@ type Client struct {
 	skipPrivateCheck bool
 	ldapUser         string
 	ldapPassword     string
+	dnsResolver      string // Custom DNS resolver IP
+	resolver         *net.Resolver
 
 	// Caches
 	sidCache    map[string]*types.DomainPrincipal
@@ -29,16 +32,35 @@ type Client struct {
 }
 
 // NewClient creates a new AD client
-func NewClient(domain, domainController string, skipPrivateCheck bool, ldapUser, ldapPassword string) *Client {
-	return &Client{
+func NewClient(domain, domainController string, skipPrivateCheck bool, ldapUser, ldapPassword, dnsResolver string) *Client {
+	client := &Client{
 		domain:           domain,
 		domainController: domainController,
 		skipPrivateCheck: skipPrivateCheck,
 		ldapUser:         ldapUser,
 		ldapPassword:     ldapPassword,
+		dnsResolver:      dnsResolver,
 		sidCache:         make(map[string]*types.DomainPrincipal),
 		domainCache:      make(map[string]bool),
 	}
+
+	// Create custom resolver if DNS resolver is specified
+	if dnsResolver != "" {
+		client.resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{
+					Timeout: time.Millisecond * time.Duration(10000),
+				}
+				return d.DialContext(ctx, network, net.JoinHostPort(dnsResolver, "53"))
+			},
+		}
+	} else {
+		// Use default resolver
+		client.resolver = net.DefaultResolver
+	}
+
+	return client
 }
 
 // Connect establishes a connection to the domain controller
@@ -362,8 +384,10 @@ func (c *Client) Close() error {
 
 // resolveDomainController attempts to find a domain controller for the domain
 func (c *Client) resolveDomainController() (string, error) {
+	ctx := context.Background()
+
 	// Try SRV record lookup
-	_, addrs, err := net.LookupSRV("ldap", "tcp", c.domain)
+	_, addrs, err := c.resolver.LookupSRV(ctx, "ldap", "tcp", c.domain)
 	if err == nil && len(addrs) > 0 {
 		return strings.TrimSuffix(addrs[0].Target, "."), nil
 	}
@@ -749,8 +773,10 @@ func (c *Client) ValidateDomain(domain string) bool {
 		return valid
 	}
 
+	ctx := context.Background()
+
 	// Try to resolve the domain
-	addrs, err := net.LookupHost(domain)
+	addrs, err := c.resolver.LookupHost(ctx, domain)
 	if err != nil {
 		c.domainCache[domain] = false
 		return false

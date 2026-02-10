@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"net"
 	"os"
+	"time"
 
 	"github.com/SpecterOps/MSSQLHound/internal/collector"
 	"github.com/spf13/cobra"
@@ -19,6 +22,8 @@ var (
 	password         string
 	domain           string
 	domainController string
+	dcIP             string
+	dnsResolver      string
 	ldapUser         string
 	ldapPassword     string
 
@@ -70,6 +75,8 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	rootCmd.Flags().StringVarP(&password, "password", "p", "", "SQL login password")
 	rootCmd.Flags().StringVarP(&domain, "domain", "d", "", "Domain to use for name and SID resolution")
 	rootCmd.Flags().StringVar(&domainController, "dc", "", "Domain controller to use for resolution")
+	rootCmd.Flags().StringVar(&dcIP, "dc-ip", "", "Domain controller IP address (will be used as DNS resolver if --dns-resolver not specified)")
+	rootCmd.Flags().StringVar(&dnsResolver, "dns-resolver", "", "DNS resolver IP address for domain lookups")
 	rootCmd.Flags().StringVar(&ldapUser, "ldap-user", "", "LDAP user (DOMAIN\\user or user@domain) for GSSAPI/Kerberos bind")
 	rootCmd.Flags().StringVar(&ldapPassword, "ldap-password", "", "LDAP password for GSSAPI/Kerberos bind")
 
@@ -110,6 +117,26 @@ func run(cmd *cobra.Command, args []string) error {
 	fmt.Println("Go port: Javier Azofra at Siemens Healthineers")
 	fmt.Println()
 
+	// Configure custom DNS resolver if specified
+	// If --dc-ip is specified but --dns-resolver is not, use dc-ip as the resolver
+	resolver := dnsResolver
+	if resolver == "" && dcIP != "" {
+		resolver = dcIP
+	}
+
+	if resolver != "" {
+		fmt.Printf("Using custom DNS resolver: %s\n", resolver)
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{
+					Timeout: time.Millisecond * time.Duration(10000),
+				}
+				return d.DialContext(ctx, network, net.JoinHostPort(resolver, "53"))
+			},
+		}
+	}
+
 	// Build configuration from flags
 	config := &collector.Config{
 		ServerInstance:                  serverInstance,
@@ -119,6 +146,8 @@ func run(cmd *cobra.Command, args []string) error {
 		Password:                        password,
 		Domain:                          domain,
 		DomainController:                domainController,
+		DCIP:                            dcIP,
+		DNSResolver:                     dnsResolver,
 		LDAPUser:                        ldapUser,
 		LDAPPassword:                    ldapPassword,
 		OutputFormat:                    outputFormat,

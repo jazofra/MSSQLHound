@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,15 +67,17 @@ type Config struct {
 
 // Collector handles the data collection process
 type Collector struct {
-	config                 *Config
-	tempDir                string
-	outputFiles            []string
-	outputFilesMu          sync.Mutex // Protects outputFiles
-	serversToProcess       []*ServerToProcess
-	linkedServersToProcess []*ServerToProcess        // Linked servers discovered during processing
-	linkedServersMu        sync.Mutex                // Protects linkedServersToProcess
-	serverSPNData          map[string]*ServerSPNInfo // Track SPN data for each server, keyed by ObjectIdentifier
-	serverSPNDataMu        sync.RWMutex              // Protects serverSPNData
+	config                     *Config
+	tempDir                    string
+	outputFiles                []string
+	outputFilesMu              sync.Mutex // Protects outputFiles
+	serversToProcess           []*ServerToProcess
+	linkedServersToProcess     []*ServerToProcess        // Linked servers discovered during processing
+	linkedServersMu            sync.Mutex                // Protects linkedServersToProcess
+	serverSPNData              map[string]*ServerSPNInfo // Track SPN data for each server, keyed by ObjectIdentifier
+	serverSPNDataMu            sync.RWMutex              // Protects serverSPNData
+	skippedChangePasswordEdges map[string]bool           // Track unique skipped ChangePassword edges for CVE-2025-49758
+	skippedChangePasswordMu    sync.Mutex                // Protects skippedChangePasswordEdges
 }
 
 // ServerToProcess holds information about a server to be processed
@@ -760,7 +763,10 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 
 	// Connect to the server
 	client := mssql.NewClient(server.ConnectionString, c.config.UserID, c.config.Password)
+	client.SetDomain(c.config.Domain)
+	client.SetLDAPCredentials(c.config.LDAPUser, c.config.LDAPPassword)
 	client.SetVerbose(c.config.Verbose)
+	client.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
 	if err := client.Connect(ctx); err != nil {
 		// If hostname doesn't have a domain but we have one from linked server discovery, try FQDN
 		if server.Domain != "" && !strings.Contains(server.Hostname, ".") {
@@ -776,7 +782,10 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 			}
 
 			fqdnClient := mssql.NewClient(fqdnConnStr, c.config.UserID, c.config.Password)
+			fqdnClient.SetDomain(c.config.Domain)
+			fqdnClient.SetLDAPCredentials(c.config.LDAPUser, c.config.LDAPPassword)
 			fqdnClient.SetVerbose(c.config.Verbose)
+			fqdnClient.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
 			fqdnErr := fqdnClient.Connect(ctx)
 			if fqdnErr == nil {
 				// FQDN connection succeeded - update server info and continue
@@ -872,7 +881,7 @@ connected:
 	// Process discovered linked servers
 	c.processLinkedServers(serverInfo, server)
 
-	fmt.Printf("  Collected: %d principals, %d databases\n",
+	fmt.Printf("Collected: %d principals, %d databases\n",
 		len(serverInfo.ServerPrincipals), len(serverInfo.Databases))
 
 	// Generate output filename using PowerShell naming convention
@@ -883,7 +892,7 @@ connected:
 	}
 
 	c.addOutputFile(outputFile)
-	fmt.Printf("  Output: %s\n", outputFile)
+	fmt.Printf("Output: %s\n", outputFile)
 
 	return nil
 }
@@ -946,7 +955,7 @@ func (c *Collector) processServerFromSPNData(server *ServerToProcess, spnInfo *S
 	// Check CVE-2025-49758 patch status (will show version unknown for SPN-only data)
 	c.logCVE202549758Status(serverInfo)
 
-	fmt.Printf("  Created partial output from SPN data (connection error: %v)\n", connErr)
+	fmt.Printf("Created partial output from SPN data (connection error: %v)\n", connErr)
 
 	// Generate output using the consistent filename generation
 	outputFile := filepath.Join(c.tempDir, c.generateFilename(server))
@@ -956,7 +965,7 @@ func (c *Collector) processServerFromSPNData(server *ServerToProcess, spnInfo *S
 	}
 
 	c.addOutputFile(outputFile)
-	fmt.Printf("  Output: %s\n", outputFile)
+	fmt.Printf("Output: %s\n", outputFile)
 
 	return nil
 }
@@ -1455,7 +1464,7 @@ func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo) {
 		if !strings.Contains(identity, "\\") && !strings.Contains(identity, "@") {
 			return ""
 		}
-		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword)
+		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.config.DNSResolver)
 		principal, err := adClient.ResolveName(identity)
 		adClient.Close()
 		if err != nil || principal == nil || principal.SID == "" {
@@ -1676,8 +1685,27 @@ func (c *Collector) generateOutput(serverInfo *types.ServerInfo, outputFile stri
 		return err
 	}
 
+	// Print grouped summary of skipped ChangePassword edges due to CVE-2025-49758 patch
+	c.skippedChangePasswordMu.Lock()
+	if len(c.skippedChangePasswordEdges) > 0 {
+		// Sort names for consistent output
+		var names []string
+		for name := range c.skippedChangePasswordEdges {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		fmt.Println("Targets have securityadmin role or IMPERSONATE ANY LOGIN permission, but server is patched for CVE-2025-49758 -- Skipping ChangePassword edge for:")
+		for _, name := range names {
+			fmt.Printf("    %s\n", name)
+		}
+		// Clear the map for next server
+		c.skippedChangePasswordEdges = nil
+	}
+	c.skippedChangePasswordMu.Unlock()
+
 	nodes, edges := writer.Stats()
-	fmt.Printf("  Wrote %d nodes and %d edges\n", nodes, edges)
+	fmt.Printf("Wrote %d nodes and %d edges\n", nodes, edges)
 
 	return nil
 }
@@ -3330,7 +3358,13 @@ func (c *Collector) shouldCreateChangePasswordEdge(serverInfo *types.ServerInfo,
 		// Patched - check if target has securityadmin or IMPERSONATE ANY LOGIN
 		// If target has either, the patch prevents changing their password without current password
 		if c.hasSecurityadminRole(targetPrincipal, serverInfo) || c.hasImpersonateAnyLogin(targetPrincipal, serverInfo) {
-			c.logVerbose("Skipping ChangePassword edge to %s - server is patched for CVE-2025-49758 and target has securityadmin role or IMPERSONATE ANY LOGIN permission", targetPrincipal.Name)
+			// Track this skipped edge for grouped reporting (using map to deduplicate)
+			c.skippedChangePasswordMu.Lock()
+			if c.skippedChangePasswordEdges == nil {
+				c.skippedChangePasswordEdges = make(map[string]bool)
+			}
+			c.skippedChangePasswordEdges[targetPrincipal.Name] = true
+			c.skippedChangePasswordMu.Unlock()
 			return false
 		}
 	}
@@ -3360,12 +3394,40 @@ func (c *Collector) logCVE202549758Status(serverInfo *types.ServerInfo) {
 	}
 }
 
-// processLinkedServers handles discovered linked servers with verbose output
+// processLinkedServers resolves linked server ObjectIdentifiers and queues them for collection if enabled
 func (c *Collector) processLinkedServers(serverInfo *types.ServerInfo, server *ServerToProcess) {
 	if len(serverInfo.LinkedServers) == 0 {
 		return
 	}
 
+	// Only do expensive DNS/LDAP resolution if collecting from linked servers
+	if !c.config.CollectFromLinkedServers {
+		// When not collecting, just set basic ObjectIdentifiers for edge generation
+		for i := range serverInfo.LinkedServers {
+			ls := &serverInfo.LinkedServers[i]
+			targetHost := ls.DataSource
+			if targetHost == "" {
+				targetHost = ls.Name
+			}
+			hostname, port, instanceName := c.parseDataSource(targetHost)
+
+			// Extract domain from source server
+			sourceDomain := ""
+			if strings.Contains(serverInfo.Hostname, ".") {
+				parts := strings.SplitN(serverInfo.Hostname, ".", 2)
+				if len(parts) > 1 {
+					sourceDomain = parts[1]
+				}
+			}
+
+			// Resolve ObjectIdentifier (needed for edge generation)
+			resolvedID := c.resolveDataSourceToSID(hostname, port, instanceName, sourceDomain)
+			ls.ResolvedObjectIdentifier = resolvedID
+		}
+		return
+	}
+
+	// Full processing when collecting from linked servers (includes DNS lookups for queueing)
 	for i := range serverInfo.LinkedServers {
 		ls := &serverInfo.LinkedServers[i]
 
@@ -3429,17 +3491,9 @@ func (c *Collector) processLinkedServers(serverInfo *types.ServerInfo, server *S
 			}
 		}
 
-		// Log status for this linked server
-		if c.config.CollectFromLinkedServers {
-			if isAlreadyQueued {
-				fmt.Printf("        %s: already in queue for processing\n", resolvedHost)
-			} else {
-				fmt.Printf("        %s: will be added to processing queue (domain: %s)\n", resolvedHost, sourceDomain)
-				// Add to linked servers queue for later processing
-				c.addLinkedServerToQueue(resolvedHost, serverInfo.Hostname, sourceDomain)
-			}
-		} else {
-			c.logVerbose("        %s: skipped (use --collect-from-linked to enable collection)", resolvedHost)
+		// Add to queue if not already there
+		if !isAlreadyQueued {
+			c.addLinkedServerToQueue(resolvedHost, serverInfo.Hostname, sourceDomain)
 		}
 	}
 }

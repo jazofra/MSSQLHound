@@ -8,13 +8,13 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	mssqldb "github.com/microsoft/go-mssqldb"
-
 	"github.com/SpecterOps/MSSQLHound/internal/types"
+	_ "github.com/microsoft/go-mssqldb" // registers "sqlserver" driver
 )
 
 // convertHexSIDToString converts a hex SID (like "0x0105000000...") to standard SID format (like "S-1-5-21-...")
@@ -78,18 +78,22 @@ func convertHexSIDToString(hexSID string) string {
 
 // Client handles SQL Server connections and data collection
 type Client struct {
-	db             *sql.DB
-	serverInstance string
-	hostname       string
-	port           int
-	instanceName   string
-	userID         string
-	password       string
-	useWindowsAuth bool
-	verbose        bool
-	encrypt        bool              // Whether to use encryption
-	usePowerShell  bool              // Whether using PowerShell fallback
-	psClient       *PowerShellClient // PowerShell client for fallback
+	db                       *sql.DB
+	serverInstance           string
+	hostname                 string
+	port                     int
+	instanceName             string
+	userID                   string
+	password                 string
+	domain                   string // Domain for NTLM authentication (needed for EPA testing)
+	ldapUser                 string // LDAP user (DOMAIN\user or user@domain) for EPA testing
+	ldapPassword             string // LDAP password for EPA testing
+	useWindowsAuth           bool
+	verbose                  bool
+	encrypt                  bool              // Whether to use encryption
+	usePowerShell            bool              // Whether using PowerShell fallback
+	psClient                 *PowerShellClient // PowerShell client for fallback
+	collectFromLinkedServers bool              // Whether to collect from linked servers
 }
 
 // NewClient creates a new SQL Server client
@@ -392,6 +396,22 @@ func (c *Client) SetVerbose(verbose bool) {
 	c.verbose = verbose
 }
 
+func (c *Client) SetCollectFromLinkedServers(collect bool) {
+	c.collectFromLinkedServers = collect
+}
+
+// SetDomain sets the domain for NTLM authentication (needed for EPA testing)
+func (c *Client) SetDomain(domain string) {
+	c.domain = domain
+}
+
+// SetLDAPCredentials sets the LDAP credentials used for EPA testing.
+// The ldapUser can be in DOMAIN\user or user@domain format.
+func (c *Client) SetLDAPCredentials(ldapUser, ldapPassword string) {
+	c.ldapUser = ldapUser
+	c.ldapPassword = ldapPassword
+}
+
 // logVerbose logs a message only if verbose mode is enabled
 func (c *Client) logVerbose(format string, args ...interface{}) {
 	if c.verbose {
@@ -409,51 +429,164 @@ type EPATestResult struct {
 	EPAStatus         string
 }
 
-// TestEPA performs Extended Protection for Authentication testing
-// This tests three connection scenarios to determine the actual EPA configuration:
-// 1. Unmodified connection - normal connection attempt
-// 2. No SB (Service Binding) connection - without service binding token
-// 3. No CBT (Channel Binding Token) connection - without channel binding token
+// TestEPA performs Extended Protection for Authentication testing using raw
+// TDS+TLS+NTLM connections with controllable Channel Binding and Service Binding.
+// This matches the approach used in the Python reference implementation
+// (MssqlExtended.py / MssqlInformer.py).
+//
+// For encrypted connections (ENCRYPT_REQ): tests channel binding manipulation
+// For unencrypted connections (ENCRYPT_OFF): tests service binding manipulation
 func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 	result := &EPATestResult{}
 
-	// First, do PRELOGIN to check encryption settings
-	preloginResult, err := c.sendPrelogin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("PRELOGIN failed: %w", err)
+	// EPA testing requires LDAP/domain credentials for NTLM authentication.
+	// These are separate from the SQL auth credentials (-u/-p).
+	if c.ldapUser == "" || c.ldapPassword == "" {
+		return nil, fmt.Errorf("EPA testing requires LDAP credentials (--ldap-user and --ldap-password)")
 	}
 
-	result.EncryptionFlag = preloginResult.encryptionFlag
-	result.ForceEncryption = preloginResult.forceEncryption
+	// Parse domain and username from LDAP user (DOMAIN\user or user@domain format)
+	epaDomain, epaUsername := parseLDAPUser(c.ldapUser, c.domain)
+	if epaDomain == "" {
+		return nil, fmt.Errorf("EPA testing requires a domain (from --ldap-user DOMAIN\\user or --domain)")
+	}
 
-	c.logVerbose("Connected via TCP")
-	c.logVerbose("Sent PRELOGIN packet")
-	c.logVerbose("Received PRELOGIN response")
-	c.logVerbose("Encryption flag in response: 0x%02X (%s)", preloginResult.encryptionFlag, preloginResult.encryptionDesc)
-	c.logVerbose("Force Encryption: %s", boolToYesNo(preloginResult.forceEncryption))
+	c.logVerbose("EPA credentials: domain=%q, username=%q", epaDomain, epaUsername)
+
+	// Resolve port if needed
+	port := c.port
+	if port == 0 && c.instanceName != "" {
+		resolvedPort, err := c.resolveInstancePort(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve instance port: %w", err)
+		}
+		port = resolvedPort
+	}
+	if port == 0 {
+		port = 1433
+	}
 
 	c.logVerbose("Testing EPA settings for %s", c.serverInstance)
 
-	// Test 1: Unmodified connection (normal)
-	unmodifiedSuccess := c.testConnectionWithEPA(ctx, false, false)
-	result.UnmodifiedSuccess = unmodifiedSuccess
-	c.logVerbose("  Unmodified connection: %s", boolToSuccessFail(unmodifiedSuccess))
+	// Build a base config using LDAP credentials
+	baseConfig := func(mode EPATestMode) *EPATestConfig {
+		return &EPATestConfig{
+			Hostname: c.hostname, Port: port, InstanceName: c.instanceName,
+			Domain: epaDomain, Username: epaUsername, Password: c.ldapPassword,
+			TestMode: mode, Verbose: c.verbose,
+		}
+	}
 
-	// Test 2: No Service Binding connection
-	noSBSuccess := c.testConnectionWithEPA(ctx, true, false)
-	result.NoSBSuccess = noSBSuccess
-	c.logVerbose("  No SB connection: %s", boolToSuccessFail(noSBSuccess))
+	// Step 1: Prerequisite check - normal login must produce expected result
+	c.logVerbose("  Running prerequisite check with normal login...")
+	prereqResult, encFlag, err := runEPATest(ctx, baseConfig(EPATestNormal))
+	if err != nil {
+		return nil, fmt.Errorf("EPA prereq check failed: %w", err)
+	}
 
-	// Test 3: No Channel Binding Token connection
-	noCBTSuccess := c.testConnectionWithEPA(ctx, false, true)
-	result.NoCBTSuccess = noCBTSuccess
-	c.logVerbose("  No CBT connection: %s", boolToSuccessFail(noCBTSuccess))
+	result.EncryptionFlag = encFlag
+	result.ForceEncryption = encFlag == encryptReq
 
-	// Determine EPA status based on test results
-	result.EPAStatus = c.determineEPAStatus(result)
-	c.logVerbose("  Extended Protection: %s", result.EPAStatus)
+	c.logVerbose("  Encryption flag: 0x%02X", encFlag)
+	c.logVerbose("  Force Encryption: %s", boolToYesNo(result.ForceEncryption))
+
+	// Prereq must succeed or produce "login failed" (valid credentials response)
+	if !prereqResult.Success && !prereqResult.IsLoginFailed {
+		if prereqResult.IsUntrustedDomain {
+			return nil, fmt.Errorf("EPA prereq check failed: credentials rejected (untrusted domain)")
+		}
+		return nil, fmt.Errorf("EPA prereq check failed: unexpected response: %s", prereqResult.ErrorMessage)
+	}
+	result.UnmodifiedSuccess = prereqResult.Success
+	c.logVerbose("  Unmodified connection: %s", boolToSuccessFail(prereqResult.Success))
+
+	// Step 2: Test based on encryption setting (matching Python mssql.py flow)
+	if encFlag == encryptReq {
+		// Encrypted path: test channel binding (matching Python lines 57-78)
+		c.logVerbose("  Conducting logins while manipulating channel binding av pair over encrypted connection")
+
+		// Test with bogus CBT
+		bogusResult, _, err := runEPATest(ctx, baseConfig(EPATestBogusCBT))
+		if err != nil {
+			return nil, fmt.Errorf("EPA bogus CBT test failed: %w", err)
+		}
+
+		if bogusResult.IsUntrustedDomain {
+			// Bogus CBT rejected - EPA is enforcing channel binding
+			// Test with missing CBT to distinguish Allowed vs Required
+			missingResult, _, err := runEPATest(ctx, baseConfig(EPATestMissingCBT))
+			if err != nil {
+				return nil, fmt.Errorf("EPA missing CBT test failed: %w", err)
+			}
+
+			result.NoCBTSuccess = missingResult.Success || missingResult.IsLoginFailed
+			if missingResult.IsUntrustedDomain {
+				result.EPAStatus = "Required"
+				c.logVerbose("  Extended Protection: Required (channel binding)")
+			} else {
+				result.EPAStatus = "Allowed"
+				c.logVerbose("  Extended Protection: Allowed (channel binding)")
+			}
+		} else {
+			// Bogus CBT accepted - EPA is Off
+			result.NoCBTSuccess = true
+			result.EPAStatus = "Off"
+			c.logVerbose("  Extended Protection: Off")
+		}
+
+	} else if encFlag == encryptOff || encFlag == encryptOn {
+		// Unencrypted/optional path: test service binding (matching Python lines 80-103)
+		c.logVerbose("  Conducting logins while manipulating target service av pair over unencrypted connection")
+
+		// Test with bogus service
+		bogusResult, _, err := runEPATest(ctx, baseConfig(EPATestBogusService))
+		if err != nil {
+			return nil, fmt.Errorf("EPA bogus service test failed: %w", err)
+		}
+
+		if bogusResult.IsUntrustedDomain {
+			// Bogus service rejected - EPA is enforcing service binding
+			// Test with missing service to distinguish Allowed vs Required
+			missingResult, _, err := runEPATest(ctx, baseConfig(EPATestMissingService))
+			if err != nil {
+				return nil, fmt.Errorf("EPA missing service test failed: %w", err)
+			}
+
+			result.NoSBSuccess = missingResult.Success || missingResult.IsLoginFailed
+			if missingResult.IsUntrustedDomain {
+				result.EPAStatus = "Required"
+				c.logVerbose("  Extended Protection: Required (service binding)")
+			} else {
+				result.EPAStatus = "Allowed"
+				c.logVerbose("  Extended Protection: Allowed (service binding)")
+			}
+		} else {
+			// Bogus service accepted - EPA is Off
+			result.NoSBSuccess = true
+			result.EPAStatus = "Off"
+			c.logVerbose("  Extended Protection: Off")
+		}
+	} else {
+		result.EPAStatus = "Unknown"
+		c.logVerbose("  Extended Protection: Unknown (unsupported encryption flag 0x%02X)", encFlag)
+	}
 
 	return result, nil
+}
+
+// parseLDAPUser parses an LDAP user string in DOMAIN\user or user@domain format,
+// returning the domain and username separately. If no domain is found in the user
+// string, fallbackDomain is used.
+func parseLDAPUser(ldapUser, fallbackDomain string) (domain, username string) {
+	if strings.Contains(ldapUser, "\\") {
+		parts := strings.SplitN(ldapUser, "\\", 2)
+		return parts[0], parts[1]
+	}
+	if strings.Contains(ldapUser, "@") {
+		parts := strings.SplitN(ldapUser, "@", 2)
+		return parts[1], parts[0]
+	}
+	return fallbackDomain, ldapUser
 }
 
 // preloginResult holds the result of a PRELOGIN exchange
@@ -667,97 +800,6 @@ func (c *Client) resolveInstancePort(ctx context.Context) (int, error) {
 	return 0, fmt.Errorf("port not found in SQL Browser response")
 }
 
-// testConnectionWithEPA tests a connection with specific EPA settings
-func (c *Client) testConnectionWithEPA(ctx context.Context, disableSB bool, disableCBT bool) bool {
-	// Build connection string with specific EPA settings
-	var parts []string
-
-	parts = append(parts, fmt.Sprintf("server=%s", c.hostname))
-
-	if c.port > 0 {
-		parts = append(parts, fmt.Sprintf("port=%d", c.port))
-	}
-
-	if c.instanceName != "" {
-		parts = append(parts, fmt.Sprintf("instance=%s", c.instanceName))
-	}
-
-	if c.useWindowsAuth {
-		parts = append(parts, "trusted_connection=yes")
-	} else {
-		parts = append(parts, fmt.Sprintf("user id=%s", c.userID))
-		parts = append(parts, fmt.Sprintf("password=%s", c.password))
-	}
-
-	parts = append(parts, "TrustServerCertificate=true")
-	parts = append(parts, "app name=MSSQLHound-EPATest")
-
-	// EPA-specific settings via connection string parameters
-	if disableSB {
-		// Disable Service Binding by setting an invalid/empty SPN
-		// This simulates a connection without proper service binding
-		parts = append(parts, "ServerSPN=invalid")
-	}
-
-	if disableCBT {
-		// To test without Channel Binding, we need to use a connection without encryption
-		// When encrypt=disable, no TLS is used, so no CBT is sent
-		parts = append(parts, "encrypt=disable")
-	} else {
-		// Normal encryption setting
-		parts = append(parts, "encrypt=false")
-	}
-
-	connStr := strings.Join(parts, ";")
-
-	connector, err := mssqldb.NewConnector(connStr)
-	if err != nil {
-		return false
-	}
-
-	// Try to connect using the connector
-	db := sql.OpenDB(connector)
-	defer db.Close()
-
-	testCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	err = db.PingContext(testCtx)
-	return err == nil
-}
-
-// determineEPAStatus determines the EPA status based on test results
-func (c *Client) determineEPAStatus(result *EPATestResult) string {
-	// If all three tests succeed, EPA is Off
-	if result.UnmodifiedSuccess && result.NoSBSuccess && result.NoCBTSuccess {
-		return "Off"
-	}
-
-	// If unmodified works but No SB fails, EPA is using Service Binding
-	// This typically happens when Force Encryption is No
-	if result.UnmodifiedSuccess && !result.NoSBSuccess && result.NoCBTSuccess {
-		return "Allowed" // or Required, using Service Binding
-	}
-
-	// If unmodified works but No CBT fails, EPA is using Channel Binding
-	// This typically happens when Force Encryption is Yes
-	if result.UnmodifiedSuccess && result.NoSBSuccess && !result.NoCBTSuccess {
-		return "Allowed" // or Required, using Channel Binding
-	}
-
-	// If unmodified works but both No SB and No CBT fail
-	if result.UnmodifiedSuccess && !result.NoSBSuccess && !result.NoCBTSuccess {
-		return "Required"
-	}
-
-	// If unmodified connection fails, something else is wrong
-	if !result.UnmodifiedSuccess {
-		return "Unknown (connection failed)"
-	}
-
-	return "Unknown"
-}
-
 // boolToYesNo converts a boolean to "Yes" or "No"
 func boolToYesNo(b bool) string {
 	if b {
@@ -876,11 +918,37 @@ func (c *Client) CollectServerInfo(ctx context.Context) (*types.ServerInfo, erro
 	}
 	info.LinkedServers = linkedServers
 
-	// Print discovered linked servers with detailed information
+	// Print discovered linked servers
+	// Note: linkedServers may contain duplicates due to multiple login mappings per server
+	// Deduplicate by Name for display purposes
 	if len(linkedServers) > 0 {
-		fmt.Printf("Discovered %d linked server(s):\n", len(linkedServers))
+		// Build a map of unique linked servers by Name
+		uniqueServers := make(map[string]types.LinkedServer)
 		for _, ls := range linkedServers {
+			if _, exists := uniqueServers[ls.Name]; !exists {
+				uniqueServers[ls.Name] = ls
+			}
+		}
+
+		fmt.Printf("Discovered %d linked server(s):\n", len(uniqueServers))
+
+		// Print in consistent order (sorted by name)
+		var serverNames []string
+		for name := range uniqueServers {
+			serverNames = append(serverNames, name)
+		}
+		sort.Strings(serverNames)
+
+		for _, name := range serverNames {
+			ls := uniqueServers[name]
 			fmt.Printf("    %s -> %s\n", info.Hostname, ls.Name)
+
+			// Show skip message immediately after each server (matching PowerShell behavior)
+			if !c.collectFromLinkedServers {
+				fmt.Printf("        Skipping linked server enumeration (use -CollectFromLinkedServers to enable collection)\n")
+			}
+
+			// Show detailed info only in verbose mode
 			c.logVerbose("        Name: %s", ls.Name)
 			c.logVerbose("        DataSource: %s", ls.DataSource)
 			c.logVerbose("        Provider: %s", ls.Provider)
@@ -2200,11 +2268,12 @@ func (c *Client) collectAuthenticationMode(ctx context.Context, info *types.Serv
 	return nil
 }
 
-// collectEncryptionSettings gets the force encryption and EPA settings
-// When verbose mode is enabled, it performs actual EPA connection testing
+// collectEncryptionSettings gets the force encryption and EPA settings.
+// It performs actual EPA connection testing when domain credentials are available,
+// falling back to registry-based detection otherwise.
 func (c *Client) collectEncryptionSettings(ctx context.Context, info *types.ServerInfo) error {
-	// If verbose mode is enabled, perform actual EPA testing via connection tests
-	if c.verbose {
+	// Always attempt EPA testing if we have LDAP/domain credentials
+	if c.ldapUser != "" && c.ldapPassword != "" {
 		epaResult, err := c.TestEPA(ctx)
 		if err != nil {
 			c.logVerbose("Warning: EPA testing failed: %v, falling back to registry", err)
