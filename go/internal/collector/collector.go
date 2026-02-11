@@ -1735,6 +1735,9 @@ func (c *Collector) createServerNode(info *types.ServerInfo) *bloodhound.Node {
 	if info.ForceEncryption != "" {
 		props["forceEncryption"] = info.ForceEncryption
 	}
+	if info.StrictEncryption != "" {
+		props["strictEncryption"] = info.StrictEncryption
+	}
 	if info.ExtendedProtection != "" {
 		props["extendedProtection"] = info.ExtendedProtection
 	}
@@ -2210,9 +2213,14 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 			kinds = []string{bloodhound.NodeKinds.User, "Base"}
 		}
 
+		// Format display name to match PowerShell behavior:
+		// PS uses Resolve-DomainPrincipal which returns UserPrincipalName, DNSHostName,
+		// or SAMAccountName (in that priority order). For user accounts without UPN,
+		// this is just the bare account name (e.g., "sccmsqlsvc" not "DOMAIN\sccmsqlsvc").
+		// For computer accounts, resolveServiceAccountSIDsViaLDAP already sets Name to FQDN.
 		displayName := sa.Name
-		if c.config.Domain != "" && !strings.Contains(displayName, "@") {
-			displayName = sa.Name + "@" + c.config.Domain
+		if idx := strings.Index(displayName, "\\"); idx != -1 {
+			displayName = displayName[idx+1:]
 		}
 
 		node := &bloodhound.Node{
@@ -2691,8 +2699,10 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 	// AD PRINCIPAL RELATIONSHIP EDGES
 	// =========================================================================
 
-	// Create HasLogin edges from AD principals (users/groups) to their SQL logins
-	// Match PowerShell logic: create only for enabled logins with domain SIDs that have CONNECT SQL permission
+	// Create HasLogin and CoerceAndRelayToMSSQL edges from AD principals to their SQL logins
+	// Match PowerShell logic: iterate enabledDomainPrincipalsWithConnectSQL
+	// CoerceAndRelayToMSSQL is checked BEFORE the S-1-5-21 filter and dedup (matching PS ordering)
+	// HasLogin is only created for S-1-5-21-* SIDs with dedup
 	principalsWithLogin := make(map[string]bool)
 	for _, principal := range serverInfo.ServerPrincipals {
 		if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
@@ -2701,12 +2711,6 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 
 		// Skip disabled logins
 		if principal.IsDisabled {
-			continue
-		}
-
-		// Only process domain SIDs (S-1-5-21-*), skip NT AUTHORITY, NT SERVICE, local accounts, etc.
-		// PowerShell checks: $principal.SecurityIdentifier -like "S-1-5-21-*"
-		if !strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") {
 			continue
 		}
 
@@ -2732,7 +2736,42 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 			continue
 		}
 
-		// Skip if we already created HasLogin for this SID
+		// CoerceAndRelayToMSSQL edge if conditions are met:
+		// - Extended Protection (EPA) is Off
+		// - Login is for a computer account (name ends with $)
+		// This is checked BEFORE the S-1-5-21 filter and dedup, matching PowerShell ordering
+		if serverInfo.ExtendedProtection == "Off" && strings.HasSuffix(principal.Name, "$") {
+			// Create edge from Authenticated Users (S-1-5-11) to the SQL login
+			// The SID S-1-5-11 is prefixed with the domain for the full ObjectIdentifier
+			authedUsersSID := "S-1-5-11"
+			if c.config.Domain != "" {
+				authedUsersSID = c.config.Domain + "-S-1-5-11"
+			}
+
+			edge := c.createEdge(
+				authedUsersSID,
+				principal.ObjectIdentifier,
+				bloodhound.EdgeKinds.CoerceAndRelayTo,
+				&bloodhound.EdgeContext{
+					SourceName:    "AUTHENTICATED USERS",
+					SourceType:    "Group",
+					TargetName:    principal.Name,
+					TargetType:    bloodhound.NodeKinds.Login,
+					SQLServerName: serverInfo.SQLServerName,
+				},
+			)
+			if err := writer.WriteEdge(edge); err != nil {
+				return err
+			}
+		}
+
+		// Only process domain SIDs (S-1-5-21-*) for HasLogin edges
+		// Skip NT AUTHORITY, NT SERVICE, local accounts, etc.
+		if !strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") {
+			continue
+		}
+
+		// Skip if we already created HasLogin for this SID (dedup)
 		if principalsWithLogin[principal.SecurityIdentifier] {
 			continue
 		}
@@ -2754,34 +2793,6 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 		)
 		if err := writer.WriteEdge(edge); err != nil {
 			return err
-		}
-
-		// CoerceAndRelayToMSSQL edge if conditions are met:
-		// - Extended Protection (EPA) is Off
-		// - Login is for a computer account (name ends with $)
-		if serverInfo.ExtendedProtection == "Off" && strings.HasSuffix(principal.Name, "$") {
-			// Create edge from Authenticated Users (S-1-5-11) to the SQL login
-			// The SID S-1-5-11 is prefixed with the domain SID for the full ObjectIdentifier
-			authedUsersSID := "S-1-5-11"
-			if c.config.Domain != "" {
-				authedUsersSID = c.config.Domain + "-S-1-5-11"
-			}
-
-			edge := c.createEdge(
-				authedUsersSID,
-				principal.ObjectIdentifier,
-				bloodhound.EdgeKinds.CoerceAndRelayTo,
-				&bloodhound.EdgeContext{
-					SourceName:    "AUTHENTICATED USERS",
-					SourceType:    "Group",
-					TargetName:    principal.Name,
-					TargetType:    bloodhound.NodeKinds.Login,
-					SQLServerName: serverInfo.SQLServerName,
-				},
-			)
-			if err := writer.WriteEdge(edge); err != nil {
-				return err
-			}
 		}
 	}
 
@@ -3375,22 +3386,22 @@ func (c *Collector) shouldCreateChangePasswordEdge(serverInfo *types.ServerInfo,
 // logCVE202549758Status logs the CVE-2025-49758 vulnerability status for a server
 func (c *Collector) logCVE202549758Status(serverInfo *types.ServerInfo) {
 	if serverInfo.VersionNumber == "" && serverInfo.Version == "" {
-		fmt.Println("  Skipping CVE-2025-49758 patch status check - server version unknown")
+		c.logVerbose("Skipping CVE-2025-49758 patch status check - server version unknown")
 		return
 	}
 
 	c.logVerbose("Checking for CVE-2025-49758 patch status...")
 	result := CheckCVE202549758(serverInfo.VersionNumber, serverInfo.Version)
 	if result == nil {
-		fmt.Println("  Unable to parse SQL version for CVE-2025-49758 check")
+		c.logVerbose("Unable to parse SQL version for CVE-2025-49758 check")
 		return
 	}
 
-	c.logVerbose("Detected SQL version: %s", result.VersionDetected)
+	fmt.Printf("Detected SQL version: %s\n", result.VersionDetected)
 	if result.IsVulnerable {
-		fmt.Printf("  CVE-2025-49758: VULNERABLE (version %s, requires %s)\n", result.VersionDetected, result.RequiredVersion)
+		fmt.Printf("CVE-2025-49758: VULNERABLE (version %s, requires %s)\n", result.VersionDetected, result.RequiredVersion)
 	} else if result.IsPatched {
-		fmt.Printf("  CVE-2025-49758: NOT vulnerable (version %s)\n", result.VersionDetected)
+		c.logVerbose("CVE-2025-49758: NOT vulnerable (version %s)\n", result.VersionDetected)
 	}
 }
 

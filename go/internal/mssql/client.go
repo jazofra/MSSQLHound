@@ -1952,11 +1952,123 @@ func (c *Client) collectLinkedServers(ctx context.Context) ([]types.LinkedServer
 		s.Catalog = catalog.String
 		s.LocalLogin = localLogin.String
 		s.IsSelfMapping = usesSelf
+		s.UsesImpersonation = usesSelf
 		s.RemoteLogin = remoteName.String
 		servers = append(servers, s)
 	}
 
+	// Check remote privileges for each unique linked server
+	c.checkLinkedServerPrivileges(ctx, servers)
+
 	return servers, nil
+}
+
+// checkLinkedServerPrivileges queries each linked server via OPENQUERY to determine
+// the remote login's privileges, mixed mode auth status, and current login.
+// This matches the PowerShell implementation that checks IS_SRVROLEMEMBER,
+// CONTROL SERVER, IMPERSONATE ANY LOGIN, and IsIntegratedSecurityOnly.
+func (c *Client) checkLinkedServerPrivileges(ctx context.Context, servers []types.LinkedServer) {
+	// Track which linked server names we've already checked to avoid duplicate queries
+	checked := make(map[string]bool)
+
+	for i := range servers {
+		serverName := servers[i].Name
+		if checked[serverName] {
+			continue
+		}
+		checked[serverName] = true
+
+		// Use OPENQUERY to check privileges on the remote server
+		// The query uses a recursive CTE to find all roles (including nested)
+		// and checks for admin permissions, matching PowerShell behavior
+		query := fmt.Sprintf(`SELECT * FROM OPENQUERY([%s], '
+			WITH RoleHierarchy AS (
+				SELECT
+					p.principal_id,
+					p.name AS principal_name,
+					0 AS level
+				FROM sys.server_principals p
+				WHERE p.name = SYSTEM_USER
+
+				UNION ALL
+
+				SELECT
+					r.principal_id,
+					r.name AS principal_name,
+					rh.level + 1
+				FROM RoleHierarchy rh
+				INNER JOIN sys.server_role_members rm ON rm.member_principal_id = rh.principal_id
+				INNER JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id
+				WHERE rh.level < 10
+			),
+			AllPermissions AS (
+				SELECT DISTINCT
+					sp.permission_name,
+					sp.state
+				FROM RoleHierarchy rh
+				INNER JOIN sys.server_permissions sp ON sp.grantee_principal_id = rh.principal_id
+				WHERE sp.state = ''G''
+			)
+			SELECT
+				IS_SRVROLEMEMBER(''sysadmin'') AS IsSysadmin,
+				IS_SRVROLEMEMBER(''securityadmin'') AS IsSecurityAdmin,
+				SYSTEM_USER AS CurrentLogin,
+				CASE SERVERPROPERTY(''IsIntegratedSecurityOnly'')
+					WHEN 1 THEN 0
+					WHEN 0 THEN 1
+				END AS IsMixedMode,
+				CASE WHEN EXISTS (
+					SELECT 1 FROM AllPermissions
+					WHERE permission_name = ''CONTROL SERVER''
+				) THEN 1 ELSE 0 END AS HasControlServer,
+				CASE WHEN EXISTS (
+					SELECT 1 FROM AllPermissions
+					WHERE permission_name = ''IMPERSONATE ANY LOGIN''
+				) THEN 1 ELSE 0 END AS HasImpersonateAnyLogin
+		')`, serverName)
+
+		var isSysadmin, isSecurityAdmin, isMixedMode, hasControlServer, hasImpersonateAnyLogin sql.NullInt64
+		var currentLogin sql.NullString
+
+		err := c.DBW().QueryRowContext(ctx, query).Scan(
+			&isSysadmin,
+			&isSecurityAdmin,
+			&currentLogin,
+			&isMixedMode,
+			&hasControlServer,
+			&hasImpersonateAnyLogin,
+		)
+		if err != nil {
+			// Non-fatal: linked server may be unreachable or we may lack permissions
+			c.logVerbose("Failed to check privileges on linked server %s: %v", serverName, err)
+			continue
+		}
+
+		// Update all entries for this linked server name with the privilege info
+		for j := range servers {
+			if servers[j].Name != serverName {
+				continue
+			}
+			if isSysadmin.Valid {
+				servers[j].RemoteIsSysadmin = isSysadmin.Int64 == 1
+			}
+			if isSecurityAdmin.Valid {
+				servers[j].RemoteIsSecurityAdmin = isSecurityAdmin.Int64 == 1
+			}
+			if currentLogin.Valid {
+				servers[j].RemoteCurrentLogin = currentLogin.String
+			}
+			if isMixedMode.Valid {
+				servers[j].RemoteIsMixedMode = isMixedMode.Int64 == 1
+			}
+			if hasControlServer.Valid {
+				servers[j].RemoteHasControlServer = hasControlServer.Int64 == 1
+			}
+			if hasImpersonateAnyLogin.Valid {
+				servers[j].RemoteHasImpersonateAnyLogin = hasImpersonateAnyLogin.Int64 == 1
+			}
+		}
+	}
 }
 
 // collectServiceAccounts gets SQL Server service account information
