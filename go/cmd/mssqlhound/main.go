@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/SpecterOps/MSSQLHound/internal/collector"
@@ -144,7 +145,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ServerList:                      serverList,
 		UserID:                          userID,
 		Password:                        password,
-		Domain:                          domain,
+		Domain:                          strings.ToUpper(domain),
 		DomainController:                domainController,
 		DCIP:                            dcIP,
 		DNSResolver:                     dnsResolver,

@@ -52,13 +52,14 @@ type LocalGroupMember struct {
 
 // ServiceAccount represents a SQL Server service account
 type ServiceAccount struct {
-	ObjectIdentifier     string `json:"objectIdentifier"`
-	Name                 string `json:"name"`
-	ServiceName          string `json:"serviceName"`
-	ServiceType          string `json:"serviceType"`
-	StartupType          string `json:"startupType"`
-	SID                  string `json:"sid,omitempty"`
-	ConvertedFromBuiltIn bool   `json:"convertedFromBuiltIn,omitempty"` // True if converted from LocalSystem, NT AUTHORITY\*, etc.
+	ObjectIdentifier     string           `json:"objectIdentifier"`
+	Name                 string           `json:"name"`
+	ServiceName          string           `json:"serviceName"`
+	ServiceType          string           `json:"serviceType"`
+	StartupType          string           `json:"startupType"`
+	SID                  string           `json:"sid,omitempty"`
+	ConvertedFromBuiltIn bool             `json:"convertedFromBuiltIn,omitempty"` // True if converted from LocalSystem, NT AUTHORITY\*, etc.
+	ResolvedPrincipal    *DomainPrincipal `json:"resolvedPrincipal,omitempty"`    // Resolved AD principal for node creation
 }
 
 // ServerPrincipal represents a server-level principal (login or server role)
@@ -149,12 +150,13 @@ type ServerLoginRef struct {
 
 // DBScopedCredential represents a database-scoped credential
 type DBScopedCredential struct {
-	CredentialID       int       `json:"credentialId"`
-	Name               string    `json:"name"`
-	CredentialIdentity string    `json:"credentialIdentity"`
-	CreateDate         time.Time `json:"createDate"`
-	ModifyDate         time.Time `json:"modifyDate"`
-	ResolvedSID        string    `json:"resolvedSid,omitempty"` // Resolved AD SID for the credential identity
+	CredentialID       int              `json:"credentialId"`
+	Name               string           `json:"name"`
+	CredentialIdentity string           `json:"credentialIdentity"`
+	CreateDate         time.Time        `json:"createDate"`
+	ModifyDate         time.Time        `json:"modifyDate"`
+	ResolvedSID        string           `json:"resolvedSid,omitempty"`       // Resolved AD SID for the credential identity
+	ResolvedPrincipal  *DomainPrincipal `json:"resolvedPrincipal,omitempty"` // Resolved AD principal for node creation
 }
 
 // LinkedServer represents a linked server configuration
@@ -186,25 +188,28 @@ type LinkedServer struct {
 
 // ProxyAccount represents a SQL Agent proxy account
 type ProxyAccount struct {
-	ProxyID            int      `json:"proxyId"`
-	Name               string   `json:"name"`
-	CredentialID       int      `json:"credentialId"`
-	CredentialIdentity string   `json:"credentialIdentity"`
-	Enabled            bool     `json:"enabled"`
-	Description        string   `json:"description,omitempty"`
-	Subsystems         []string `json:"subsystems,omitempty"`
-	Logins             []string `json:"logins,omitempty"`
-	ResolvedSID        string   `json:"resolvedSid,omitempty"` // Resolved AD SID for the credential identity
+	ProxyID            int              `json:"proxyId"`
+	Name               string           `json:"name"`
+	CredentialID       int              `json:"credentialId"`
+	CredentialName     string           `json:"credentialName,omitempty"`
+	CredentialIdentity string           `json:"credentialIdentity"`
+	Enabled            bool             `json:"enabled"`
+	Description        string           `json:"description,omitempty"`
+	Subsystems         []string         `json:"subsystems,omitempty"`
+	Logins             []string         `json:"logins,omitempty"`
+	ResolvedSID        string           `json:"resolvedSid,omitempty"`       // Resolved AD SID for the credential identity
+	ResolvedPrincipal  *DomainPrincipal `json:"resolvedPrincipal,omitempty"` // Resolved AD principal for node creation
 }
 
 // Credential represents a server-level credential
 type Credential struct {
-	CredentialID       int       `json:"credentialId"`
-	Name               string    `json:"name"`
-	CredentialIdentity string    `json:"credentialIdentity"`
-	CreateDate         time.Time `json:"createDate"`
-	ModifyDate         time.Time `json:"modifyDate"`
-	ResolvedSID        string    `json:"resolvedSid,omitempty"` // Resolved AD SID for the credential identity
+	CredentialID       int              `json:"credentialId"`
+	Name               string           `json:"name"`
+	CredentialIdentity string           `json:"credentialIdentity"`
+	CreateDate         time.Time        `json:"createDate"`
+	ModifyDate         time.Time        `json:"modifyDate"`
+	ResolvedSID        string           `json:"resolvedSid,omitempty"`       // Resolved AD SID for the credential identity
+	ResolvedPrincipal  *DomainPrincipal `json:"resolvedPrincipal,omitempty"` // Resolved AD principal for node creation
 }
 
 // DomainPrincipal represents a resolved Active Directory principal
@@ -214,6 +219,8 @@ type DomainPrincipal struct {
 	Name              string   `json:"name"`
 	SAMAccountName    string   `json:"samAccountName,omitempty"`
 	DistinguishedName string   `json:"distinguishedName,omitempty"`
+	UserPrincipalName string   `json:"userPrincipalName,omitempty"`
+	DNSHostName       string   `json:"dnsHostName,omitempty"`
 	Domain            string   `json:"domain"`
 	ObjectClass       string   `json:"objectClass"` // user, group, computer
 	Enabled           bool     `json:"enabled"`

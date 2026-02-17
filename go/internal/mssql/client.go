@@ -1893,99 +1893,96 @@ func (c *Client) collectDatabasePermissions(ctx context.Context, principals []ty
 // collectLinkedServers gets all linked server configurations with login mappings.
 // Each login mapping creates a separate LinkedServer entry (matching PowerShell behavior).
 func (c *Client) collectLinkedServers(ctx context.Context) ([]types.LinkedServer, error) {
-	// Join servers with linked_logins to create one entry per login mapping
-	// This matches the PowerShell behavior where each LocalLogin creates a separate edge
+	// Use a single server-side SQL batch that recursively discovers linked servers
+	// through chained links, matching the PowerShell implementation.
+	// This discovers not just direct linked servers but also linked servers
+	// accessible through other linked servers (e.g., A -> B -> C).
 	query := `
-		SELECT 
-			s.server_id,
-			s.name,
-			s.product,
-			s.provider,
-			s.data_source,
-			s.catalog,
-			s.is_linked,
-			s.is_remote_login_enabled,
-			s.is_rpc_out_enabled,
-			s.is_data_access_enabled,
-			COALESCE(sp.name, 'All Logins') AS local_login,
-			ll.uses_self_credential,
-			ll.remote_name
-		FROM sys.servers s
-		INNER JOIN sys.linked_logins ll ON s.server_id = ll.server_id
-		LEFT JOIN sys.server_principals sp ON ll.local_principal_id = sp.principal_id
-		WHERE s.is_linked = 1
-		ORDER BY s.server_id, ll.local_principal_id
-	`
+SET NOCOUNT ON;
 
-	rows, err := c.DBW().QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+-- Create temp table for linked server discovery
+CREATE TABLE #mssqlhound_linked (
+	ID INT IDENTITY(1,1),
+	Level INT,
+	Path NVARCHAR(MAX),
+	SourceServer NVARCHAR(128),
+	LinkedServer NVARCHAR(128),
+	DataSource NVARCHAR(128),
+	Product NVARCHAR(128),
+	Provider NVARCHAR(128),
+	DataAccess BIT,
+	RPCOut BIT,
+	LocalLogin NVARCHAR(128),
+	UsesImpersonation BIT,
+	RemoteLogin NVARCHAR(128),
+	RemoteIsSysadmin BIT DEFAULT 0,
+	RemoteIsSecurityAdmin BIT DEFAULT 0,
+	RemoteCurrentLogin NVARCHAR(128),
+	RemoteIsMixedMode BIT DEFAULT 0,
+	RemoteHasControlServer BIT DEFAULT 0,
+	RemoteHasImpersonateAnyLogin BIT DEFAULT 0,
+	ErrorMsg NVARCHAR(MAX) NULL
+);
 
-	var servers []types.LinkedServer
+-- Insert local server's linked servers (Level 0)
+INSERT INTO #mssqlhound_linked (Level, Path, SourceServer, LinkedServer, DataSource, Product, Provider, DataAccess, RPCOut,
+                            LocalLogin, UsesImpersonation, RemoteLogin)
+SELECT
+	0,
+	@@SERVERNAME + ' -> ' + s.name,
+	@@SERVERNAME,
+	s.name,
+	s.data_source,
+	s.product,
+	s.provider,
+	s.is_data_access_enabled,
+	s.is_rpc_out_enabled,
+	COALESCE(sp.name, 'All Logins'),
+	ll.uses_self_credential,
+	ll.remote_name
+FROM sys.servers s
+INNER JOIN sys.linked_logins ll ON s.server_id = ll.server_id
+LEFT JOIN sys.server_principals sp ON ll.local_principal_id = sp.principal_id
+WHERE s.is_linked = 1;
 
-	for rows.Next() {
-		var s types.LinkedServer
-		var catalog, localLogin, remoteName sql.NullString
-		var usesSelf bool
+-- Declare all variables upfront (T-SQL has batch-level scoping)
+DECLARE @CheckID INT, @CheckLinkedServer NVARCHAR(128);
+DECLARE @CheckSQL NVARCHAR(MAX);
+DECLARE @CheckSQL2 NVARCHAR(MAX);
+DECLARE @LinkedServer NVARCHAR(128), @Path NVARCHAR(MAX);
+DECLARE @sql NVARCHAR(MAX);
+DECLARE @CurrentLevel INT;
+DECLARE @MaxLevel INT;
+DECLARE @RowsToProcess INT;
+DECLARE @PrivilegeResults TABLE (
+	IsSysadmin INT,
+	IsSecurityAdmin INT,
+	CurrentLogin NVARCHAR(128),
+	IsMixedMode INT,
+	HasControlServer INT,
+	HasImpersonateAnyLogin INT
+);
+DECLARE @ProcessedServers TABLE (ServerName NVARCHAR(128));
 
-		err := rows.Scan(
-			&s.ServerID,
-			&s.Name,
-			&s.Product,
-			&s.Provider,
-			&s.DataSource,
-			&catalog,
-			&s.IsLinkedServer,
-			&s.IsRemoteLoginEnabled,
-			&s.IsRPCOutEnabled,
-			&s.IsDataAccessEnabled,
-			&localLogin,
-			&usesSelf,
-			&remoteName,
-		)
-		if err != nil {
-			return nil, err
-		}
+-- Check privileges for Level 0 entries
 
-		s.Catalog = catalog.String
-		s.LocalLogin = localLogin.String
-		s.IsSelfMapping = usesSelf
-		s.UsesImpersonation = usesSelf
-		s.RemoteLogin = remoteName.String
-		servers = append(servers, s)
-	}
+DECLARE check_cursor CURSOR FOR
+SELECT ID, LinkedServer FROM #mssqlhound_linked WHERE Level = 0;
 
-	// Check remote privileges for each unique linked server
-	c.checkLinkedServerPrivileges(ctx, servers)
+OPEN check_cursor;
+FETCH NEXT FROM check_cursor INTO @CheckID, @CheckLinkedServer;
 
-	return servers, nil
-}
+WHILE @@FETCH_STATUS = 0
+BEGIN
+	DELETE FROM @PrivilegeResults;
 
-// checkLinkedServerPrivileges queries each linked server via OPENQUERY to determine
-// the remote login's privileges, mixed mode auth status, and current login.
-// This matches the PowerShell implementation that checks IS_SRVROLEMEMBER,
-// CONTROL SERVER, IMPERSONATE ANY LOGIN, and IsIntegratedSecurityOnly.
-func (c *Client) checkLinkedServerPrivileges(ctx context.Context, servers []types.LinkedServer) {
-	// Track which linked server names we've already checked to avoid duplicate queries
-	checked := make(map[string]bool)
-
-	for i := range servers {
-		serverName := servers[i].Name
-		if checked[serverName] {
-			continue
-		}
-		checked[serverName] = true
-
-		// Use OPENQUERY to check privileges on the remote server
-		// The query uses a recursive CTE to find all roles (including nested)
-		// and checks for admin permissions, matching PowerShell behavior
-		query := fmt.Sprintf(`SELECT * FROM OPENQUERY([%s], '
+	BEGIN TRY
+		SET @CheckSQL = 'SELECT * FROM OPENQUERY([' + @CheckLinkedServer + '], ''
 			WITH RoleHierarchy AS (
 				SELECT
 					p.principal_id,
 					p.name AS principal_name,
+					CAST(p.name AS NVARCHAR(MAX)) AS path,
 					0 AS level
 				FROM sys.server_principals p
 				WHERE p.name = SYSTEM_USER
@@ -1995,6 +1992,7 @@ func (c *Client) checkLinkedServerPrivileges(ctx context.Context, servers []type
 				SELECT
 					r.principal_id,
 					r.name AS principal_name,
+					rh.path + '''' -> '''' + r.name,
 					rh.level + 1
 				FROM RoleHierarchy rh
 				INNER JOIN sys.server_role_members rm ON rm.member_principal_id = rh.principal_id
@@ -2007,69 +2005,315 @@ func (c *Client) checkLinkedServerPrivileges(ctx context.Context, servers []type
 					sp.state
 				FROM RoleHierarchy rh
 				INNER JOIN sys.server_permissions sp ON sp.grantee_principal_id = rh.principal_id
-				WHERE sp.state = ''G''
+				WHERE sp.state = ''''G''''
 			)
 			SELECT
-				IS_SRVROLEMEMBER(''sysadmin'') AS IsSysadmin,
-				IS_SRVROLEMEMBER(''securityadmin'') AS IsSecurityAdmin,
+				IS_SRVROLEMEMBER(''''sysadmin'''') AS IsSysadmin,
+				IS_SRVROLEMEMBER(''''securityadmin'''') AS IsSecurityAdmin,
 				SYSTEM_USER AS CurrentLogin,
-				CASE SERVERPROPERTY(''IsIntegratedSecurityOnly'')
+				CASE SERVERPROPERTY(''''IsIntegratedSecurityOnly'''')
 					WHEN 1 THEN 0
 					WHEN 0 THEN 1
 				END AS IsMixedMode,
 				CASE WHEN EXISTS (
 					SELECT 1 FROM AllPermissions
-					WHERE permission_name = ''CONTROL SERVER''
+					WHERE permission_name = ''''CONTROL SERVER''''
 				) THEN 1 ELSE 0 END AS HasControlServer,
 				CASE WHEN EXISTS (
 					SELECT 1 FROM AllPermissions
-					WHERE permission_name = ''IMPERSONATE ANY LOGIN''
+					WHERE permission_name = ''''IMPERSONATE ANY LOGIN''''
 				) THEN 1 ELSE 0 END AS HasImpersonateAnyLogin
-		')`, serverName)
+		'')';
 
-		var isSysadmin, isSecurityAdmin, isMixedMode, hasControlServer, hasImpersonateAnyLogin sql.NullInt64
-		var currentLogin sql.NullString
+		INSERT INTO @PrivilegeResults
+		EXEC sp_executesql @CheckSQL;
 
-		err := c.DBW().QueryRowContext(ctx, query).Scan(
+		UPDATE #mssqlhound_linked
+		SET RemoteIsSysadmin = (SELECT IsSysadmin FROM @PrivilegeResults),
+			RemoteIsSecurityAdmin = (SELECT IsSecurityAdmin FROM @PrivilegeResults),
+			RemoteCurrentLogin = (SELECT CurrentLogin FROM @PrivilegeResults),
+			RemoteIsMixedMode = (SELECT IsMixedMode FROM @PrivilegeResults),
+			RemoteHasControlServer = (SELECT HasControlServer FROM @PrivilegeResults),
+			RemoteHasImpersonateAnyLogin = (SELECT HasImpersonateAnyLogin FROM @PrivilegeResults)
+		WHERE ID = @CheckID;
+
+	END TRY
+	BEGIN CATCH
+		UPDATE #mssqlhound_linked
+		SET ErrorMsg = ERROR_MESSAGE()
+		WHERE ID = @CheckID;
+	END CATCH
+
+	FETCH NEXT FROM check_cursor INTO @CheckID, @CheckLinkedServer;
+END
+
+CLOSE check_cursor;
+DEALLOCATE check_cursor;
+
+-- Recursive discovery of chained linked servers
+SET @CurrentLevel = 0;
+SET @MaxLevel = 10;
+SET @RowsToProcess = 1;
+
+WHILE @RowsToProcess > 0 AND @CurrentLevel < @MaxLevel
+BEGIN
+	DECLARE process_cursor CURSOR FOR
+		SELECT DISTINCT LinkedServer, MIN(Path)
+		FROM #mssqlhound_linked
+		WHERE Level = @CurrentLevel
+			AND LinkedServer NOT IN (SELECT ServerName FROM @ProcessedServers)
+		GROUP BY LinkedServer;
+
+	OPEN process_cursor;
+	FETCH NEXT FROM process_cursor INTO @LinkedServer, @Path;
+
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		BEGIN TRY
+			SET @sql = '
+			INSERT INTO #mssqlhound_linked (Level, Path, SourceServer, LinkedServer, DataSource, Product, Provider, DataAccess, RPCOut,
+											LocalLogin, UsesImpersonation, RemoteLogin)
+			SELECT DISTINCT
+				' + CAST(@CurrentLevel + 1 AS NVARCHAR) + ',
+				''' + @Path + ' -> '' + s.name,
+				''' + @LinkedServer + ''',
+				s.name,
+				s.data_source,
+				s.product,
+				s.provider,
+				s.is_data_access_enabled,
+				s.is_rpc_out_enabled,
+				COALESCE(sp.name, ''All Logins''),
+				ll.uses_self_credential,
+				ll.remote_name
+			FROM [' + @LinkedServer + '].[master].[sys].[servers] s
+			INNER JOIN [' + @LinkedServer + '].[master].[sys].[linked_logins] ll ON s.server_id = ll.server_id
+			LEFT JOIN [' + @LinkedServer + '].[master].[sys].[server_principals] sp ON ll.local_principal_id = sp.principal_id
+			WHERE s.is_linked = 1
+				AND ''' + @Path + ''' NOT LIKE ''%'' + s.name + '' ->%''
+				AND s.data_source NOT IN (
+					SELECT DISTINCT DataSource
+					FROM #mssqlhound_linked
+					WHERE DataSource IS NOT NULL
+				)';
+
+			EXEC sp_executesql @sql;
+			INSERT INTO @ProcessedServers VALUES (@LinkedServer);
+
+		END TRY
+		BEGIN CATCH
+			INSERT INTO @ProcessedServers VALUES (@LinkedServer);
+		END CATCH
+
+		FETCH NEXT FROM process_cursor INTO @LinkedServer, @Path;
+	END
+
+	CLOSE process_cursor;
+	DEALLOCATE process_cursor;
+
+	-- Check privileges for newly discovered servers
+	DECLARE privilege_cursor CURSOR FOR
+		SELECT ID, LinkedServer
+		FROM #mssqlhound_linked
+		WHERE Level = @CurrentLevel + 1
+			AND RemoteIsSysadmin IS NULL;
+
+	OPEN privilege_cursor;
+	FETCH NEXT FROM privilege_cursor INTO @CheckID, @CheckLinkedServer;
+
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		DELETE FROM @PrivilegeResults;
+
+		BEGIN TRY
+			SET @CheckSQL2 = 'SELECT * FROM OPENQUERY([' + @CheckLinkedServer + '], ''
+				WITH RoleHierarchy AS (
+					SELECT
+						p.principal_id,
+						p.name AS principal_name,
+						CAST(p.name AS NVARCHAR(MAX)) AS path,
+						0 AS level
+					FROM sys.server_principals p
+					WHERE p.name = SYSTEM_USER
+
+					UNION ALL
+
+					SELECT
+						r.principal_id,
+						r.name AS principal_name,
+						rh.path + '''' -> '''' + r.name,
+						rh.level + 1
+					FROM RoleHierarchy rh
+					INNER JOIN sys.server_role_members rm ON rm.member_principal_id = rh.principal_id
+					INNER JOIN sys.server_principals r ON rm.role_principal_id = r.principal_id
+					WHERE rh.level < 10
+				),
+				AllPermissions AS (
+					SELECT DISTINCT
+						sp.permission_name,
+						sp.state
+					FROM RoleHierarchy rh
+					INNER JOIN sys.server_permissions sp ON sp.grantee_principal_id = rh.principal_id
+					WHERE sp.state = ''''G''''
+				)
+				SELECT
+					IS_SRVROLEMEMBER(''''sysadmin'''') AS IsSysadmin,
+					IS_SRVROLEMEMBER(''''securityadmin'''') AS IsSecurityAdmin,
+					SYSTEM_USER AS CurrentLogin,
+					CASE SERVERPROPERTY(''''IsIntegratedSecurityOnly'''')
+						WHEN 1 THEN 0
+						WHEN 0 THEN 1
+					END AS IsMixedMode,
+					CASE WHEN EXISTS (
+						SELECT 1 FROM AllPermissions
+						WHERE permission_name = ''''CONTROL SERVER''''
+					) THEN 1 ELSE 0 END AS HasControlServer,
+					CASE WHEN EXISTS (
+						SELECT 1 FROM AllPermissions
+						WHERE permission_name = ''''IMPERSONATE ANY LOGIN''''
+					) THEN 1 ELSE 0 END AS HasImpersonateAnyLogin
+			'')';
+
+			INSERT INTO @PrivilegeResults
+			EXEC sp_executesql @CheckSQL2;
+
+			UPDATE #mssqlhound_linked
+			SET RemoteIsSysadmin = (SELECT IsSysadmin FROM @PrivilegeResults),
+				RemoteIsSecurityAdmin = (SELECT IsSecurityAdmin FROM @PrivilegeResults),
+				RemoteCurrentLogin = (SELECT CurrentLogin FROM @PrivilegeResults),
+				RemoteIsMixedMode = (SELECT IsMixedMode FROM @PrivilegeResults),
+				RemoteHasControlServer = (SELECT HasControlServer FROM @PrivilegeResults),
+				RemoteHasImpersonateAnyLogin = (SELECT HasImpersonateAnyLogin FROM @PrivilegeResults)
+			WHERE ID = @CheckID;
+
+		END TRY
+		BEGIN CATCH
+			-- Continue on error
+		END CATCH
+
+		FETCH NEXT FROM privilege_cursor INTO @CheckID, @CheckLinkedServer;
+	END
+
+	CLOSE privilege_cursor;
+	DEALLOCATE privilege_cursor;
+
+	-- Count new unprocessed servers
+	SELECT @RowsToProcess = COUNT(DISTINCT LinkedServer)
+	FROM #mssqlhound_linked
+	WHERE Level = @CurrentLevel + 1
+		AND LinkedServer NOT IN (SELECT ServerName FROM @ProcessedServers);
+
+	SET @CurrentLevel = @CurrentLevel + 1;
+END
+
+-- Return all results
+SET NOCOUNT OFF;
+SELECT
+	Level,
+	Path,
+	SourceServer,
+	LinkedServer,
+	DataSource,
+	Product,
+	Provider,
+	DataAccess,
+	RPCOut,
+	LocalLogin,
+	UsesImpersonation,
+	RemoteLogin,
+	RemoteIsSysadmin,
+	RemoteIsSecurityAdmin,
+	RemoteCurrentLogin,
+	RemoteIsMixedMode,
+	RemoteHasControlServer,
+	RemoteHasImpersonateAnyLogin
+FROM #mssqlhound_linked
+ORDER BY Level, Path;
+
+DROP TABLE #mssqlhound_linked;
+`
+
+	rows, err := c.DBW().QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var servers []types.LinkedServer
+
+	for rows.Next() {
+		var s types.LinkedServer
+		var level int
+		var path, sourceServer, localLogin, remoteLogin, remoteCurrentLogin sql.NullString
+		var dataAccess, rpcOut, usesImpersonation sql.NullBool
+		var isSysadmin, isSecurityAdmin, isMixedMode, hasControlServer, hasImpersonateAnyLogin sql.NullBool
+
+		err := rows.Scan(
+			&level,
+			&path,
+			&sourceServer,
+			&s.Name,
+			&s.DataSource,
+			&s.Product,
+			&s.Provider,
+			&dataAccess,
+			&rpcOut,
+			&localLogin,
+			&usesImpersonation,
+			&remoteLogin,
 			&isSysadmin,
 			&isSecurityAdmin,
-			&currentLogin,
+			&remoteCurrentLogin,
 			&isMixedMode,
 			&hasControlServer,
 			&hasImpersonateAnyLogin,
 		)
 		if err != nil {
-			// Non-fatal: linked server may be unreachable or we may lack permissions
-			c.logVerbose("Failed to check privileges on linked server %s: %v", serverName, err)
-			continue
+			return nil, err
 		}
 
-		// Update all entries for this linked server name with the privilege info
-		for j := range servers {
-			if servers[j].Name != serverName {
-				continue
-			}
-			if isSysadmin.Valid {
-				servers[j].RemoteIsSysadmin = isSysadmin.Int64 == 1
-			}
-			if isSecurityAdmin.Valid {
-				servers[j].RemoteIsSecurityAdmin = isSecurityAdmin.Int64 == 1
-			}
-			if currentLogin.Valid {
-				servers[j].RemoteCurrentLogin = currentLogin.String
-			}
-			if isMixedMode.Valid {
-				servers[j].RemoteIsMixedMode = isMixedMode.Int64 == 1
-			}
-			if hasControlServer.Valid {
-				servers[j].RemoteHasControlServer = hasControlServer.Int64 == 1
-			}
-			if hasImpersonateAnyLogin.Valid {
-				servers[j].RemoteHasImpersonateAnyLogin = hasImpersonateAnyLogin.Int64 == 1
-			}
+		s.IsLinkedServer = true
+		s.Path = path.String
+		s.SourceServer = sourceServer.String
+		s.LocalLogin = localLogin.String
+		s.RemoteLogin = remoteLogin.String
+		if dataAccess.Valid {
+			s.IsDataAccessEnabled = dataAccess.Bool
 		}
+		if rpcOut.Valid {
+			s.IsRPCOutEnabled = rpcOut.Bool
+		}
+		if usesImpersonation.Valid {
+			s.IsSelfMapping = usesImpersonation.Bool
+			s.UsesImpersonation = usesImpersonation.Bool
+		}
+		if isSysadmin.Valid {
+			s.RemoteIsSysadmin = isSysadmin.Bool
+		}
+		if isSecurityAdmin.Valid {
+			s.RemoteIsSecurityAdmin = isSecurityAdmin.Bool
+		}
+		if remoteCurrentLogin.Valid {
+			s.RemoteCurrentLogin = remoteCurrentLogin.String
+		}
+		if isMixedMode.Valid {
+			s.RemoteIsMixedMode = isMixedMode.Bool
+		}
+		if hasControlServer.Valid {
+			s.RemoteHasControlServer = hasControlServer.Bool
+		}
+		if hasImpersonateAnyLogin.Valid {
+			s.RemoteHasImpersonateAnyLogin = hasImpersonateAnyLogin.Bool
+		}
+
+		servers = append(servers, s)
 	}
+
+	return servers, nil
 }
+
+// checkLinkedServerPrivileges is no longer needed as privilege checking
+// is now integrated into the recursive collectLinkedServers() query.
 
 // collectServiceAccounts gets SQL Server service account information
 func (c *Client) collectServiceAccounts(ctx context.Context, info *types.ServerInfo) error {
@@ -2276,6 +2520,7 @@ func (c *Client) collectProxyAccounts(ctx context.Context, info *types.ServerInf
 			p.proxy_id,
 			p.name AS proxy_name,
 			p.credential_id,
+			c.name AS credential_name,
 			c.credential_identity,
 			p.enabled,
 			ISNULL(p.description, '') AS description
@@ -2301,6 +2546,7 @@ func (c *Client) collectProxyAccounts(ctx context.Context, info *types.ServerInf
 			&proxy.ProxyID,
 			&proxy.Name,
 			&proxy.CredentialID,
+			&proxy.CredentialName,
 			&proxy.CredentialIdentity,
 			&enabled,
 			&proxy.Description,

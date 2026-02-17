@@ -417,7 +417,7 @@ func (c *Collector) buildServerList() error {
 			if strings.Contains(server.Hostname, ".") {
 				parts := strings.SplitN(server.Hostname, ".", 2)
 				if len(parts) == 2 && parts[1] != "" {
-					c.config.Domain = strings.ToLower(parts[1])
+					c.config.Domain = strings.ToUpper(parts[1])
 					c.logVerbose("Auto-detected domain from server FQDN: %s", c.config.Domain)
 					break
 				}
@@ -481,16 +481,19 @@ func (c *Collector) tryResolveSID(server *ServerToProcess) {
 	}
 }
 
-// detectDomain attempts to auto-detect the domain from environment variables or system configuration
+// detectDomain attempts to auto-detect the domain from environment variables or system configuration.
+// Returns the domain name in UPPERCASE to match BloodHound conventions.
 func (c *Collector) detectDomain() string {
 	// Try USERDNSDOMAIN environment variable (Windows domain-joined machines)
 	if domain := os.Getenv("USERDNSDOMAIN"); domain != "" {
+		domain = strings.ToUpper(domain)
 		c.logVerbose("Detected domain from USERDNSDOMAIN: %s", domain)
 		return domain
 	}
 
 	// Try USERDOMAIN environment variable as fallback
 	if domain := os.Getenv("USERDOMAIN"); domain != "" {
+		domain = strings.ToUpper(domain)
 		c.logVerbose("Detected domain from USERDOMAIN: %s", domain)
 		return domain
 	}
@@ -504,15 +507,17 @@ func (c *Collector) detectDomain() string {
 				if strings.HasPrefix(line, "search ") {
 					parts := strings.Fields(line)
 					if len(parts) > 1 {
-						c.logVerbose("Detected domain from /etc/resolv.conf: %s", parts[1])
-						return parts[1]
+						domain := strings.ToUpper(parts[1])
+						c.logVerbose("Detected domain from /etc/resolv.conf: %s", domain)
+						return domain
 					}
 				}
 				if strings.HasPrefix(line, "domain ") {
 					parts := strings.Fields(line)
 					if len(parts) > 1 {
-						c.logVerbose("Detected domain from /etc/resolv.conf: %s", parts[1])
-						return parts[1]
+						domain := strings.ToUpper(parts[1])
+						c.logVerbose("Detected domain from /etc/resolv.conf: %s", domain)
+						return domain
 					}
 				}
 			}
@@ -1418,6 +1423,7 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 					// Use the resolved name (which is DNSHostName for computers in our updated AD client)
 					oldName := sa.Name
 					sa.Name = principal.Name
+					sa.ResolvedPrincipal = principal
 					c.logVerbose("  Updated computer account name from %s to %s", oldName, sa.Name)
 					fmt.Printf("  Updated computer account name from %s to %s\n", oldName, sa.Name)
 				}
@@ -1443,6 +1449,7 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 
 			sa.SID = principal.SID
 			sa.ObjectIdentifier = principal.SID
+			sa.ResolvedPrincipal = principal
 			// Also update the name if it's a computer
 			if principal.ObjectClass == "computer" {
 				sa.Name = principal.Name
@@ -1459,44 +1466,49 @@ func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo) {
 		return
 	}
 
-	// Helper to resolve a credential identity (domain\user or user@domain) to a SID
-	resolveIdentity := func(identity string) string {
-		if !strings.Contains(identity, "\\") && !strings.Contains(identity, "@") {
-			return ""
+	// Helper to resolve a credential identity to a domain principal via LDAP.
+	// Attempts resolution for all identities (not just domain\user or user@domain format),
+	// matching PowerShell's Resolve-DomainPrincipal behavior.
+	resolveIdentity := func(identity string) *types.DomainPrincipal {
+		if identity == "" {
+			return nil
 		}
 		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.config.DNSResolver)
 		principal, err := adClient.ResolveName(identity)
 		adClient.Close()
 		if err != nil || principal == nil || principal.SID == "" {
-			return ""
+			return nil
 		}
-		return principal.SID
+		return principal
 	}
 
 	// Resolve server-level credentials (mapped via ALTER LOGIN ... WITH CREDENTIAL)
 	for i := range serverInfo.ServerPrincipals {
 		if serverInfo.ServerPrincipals[i].MappedCredential != nil {
 			cred := serverInfo.ServerPrincipals[i].MappedCredential
-			if sid := resolveIdentity(cred.CredentialIdentity); sid != "" {
-				cred.ResolvedSID = sid
-				c.logVerbose("  Resolved credential %s -> %s", cred.CredentialIdentity, sid)
+			if principal := resolveIdentity(cred.CredentialIdentity); principal != nil {
+				cred.ResolvedSID = principal.SID
+				cred.ResolvedPrincipal = principal
+				c.logVerbose("  Resolved credential %s -> %s", cred.CredentialIdentity, principal.SID)
 			}
 		}
 	}
 
 	// Resolve standalone credentials (for HasMappedCred edges)
 	for i := range serverInfo.Credentials {
-		if sid := resolveIdentity(serverInfo.Credentials[i].CredentialIdentity); sid != "" {
-			serverInfo.Credentials[i].ResolvedSID = sid
-			c.logVerbose("  Resolved credential %s -> %s", serverInfo.Credentials[i].CredentialIdentity, sid)
+		if principal := resolveIdentity(serverInfo.Credentials[i].CredentialIdentity); principal != nil {
+			serverInfo.Credentials[i].ResolvedSID = principal.SID
+			serverInfo.Credentials[i].ResolvedPrincipal = principal
+			c.logVerbose("  Resolved credential %s -> %s", serverInfo.Credentials[i].CredentialIdentity, principal.SID)
 		}
 	}
 
 	// Resolve proxy account credentials
 	for i := range serverInfo.ProxyAccounts {
-		if sid := resolveIdentity(serverInfo.ProxyAccounts[i].CredentialIdentity); sid != "" {
-			serverInfo.ProxyAccounts[i].ResolvedSID = sid
-			c.logVerbose("  Resolved proxy credential %s -> %s", serverInfo.ProxyAccounts[i].CredentialIdentity, sid)
+		if principal := resolveIdentity(serverInfo.ProxyAccounts[i].CredentialIdentity); principal != nil {
+			serverInfo.ProxyAccounts[i].ResolvedSID = principal.SID
+			serverInfo.ProxyAccounts[i].ResolvedPrincipal = principal
+			c.logVerbose("  Resolved proxy credential %s -> %s", serverInfo.ProxyAccounts[i].CredentialIdentity, principal.SID)
 		}
 	}
 
@@ -1504,9 +1516,10 @@ func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo) {
 	for i := range serverInfo.Databases {
 		for j := range serverInfo.Databases[i].DBScopedCredentials {
 			cred := &serverInfo.Databases[i].DBScopedCredentials[j]
-			if sid := resolveIdentity(cred.CredentialIdentity); sid != "" {
-				cred.ResolvedSID = sid
-				c.logVerbose("  Resolved DB scoped credential %s -> %s", cred.CredentialIdentity, sid)
+			if principal := resolveIdentity(cred.CredentialIdentity); principal != nil {
+				cred.ResolvedSID = principal.SID
+				cred.ResolvedPrincipal = principal
+				c.logVerbose("  Resolved DB scoped credential %s -> %s", cred.CredentialIdentity, principal.SID)
 			}
 		}
 	}
@@ -1615,12 +1628,21 @@ func (c *Collector) generateOutput(serverInfo *types.ServerInfo, outputFile stri
 	}
 
 	// Create linked server nodes (matching PowerShell behavior)
+	// If a linked server resolves to the same ObjectIdentifier as the primary server,
+	// merge the linked server properties into the server node instead of creating a duplicate.
 	createdLinkedServerNodes := make(map[string]bool)
 	for _, linkedServer := range serverInfo.LinkedServers {
 		if linkedServer.DataSource == "" || linkedServer.ResolvedObjectIdentifier == "" {
 			continue
 		}
 		if createdLinkedServerNodes[linkedServer.ResolvedObjectIdentifier] {
+			continue
+		}
+
+		// If this linked server target is the primary server itself, skip creating a
+		// separate node — the properties were already merged into the server node above.
+		if linkedServer.ResolvedObjectIdentifier == serverInfo.ObjectIdentifier {
+			createdLinkedServerNodes[linkedServer.ResolvedObjectIdentifier] = true
 			continue
 		}
 
@@ -1650,9 +1672,22 @@ func (c *Collector) generateOutput(serverInfo *types.ServerInfo, outputFile stri
 		createdLinkedServerNodes[linkedServer.ResolvedObjectIdentifier] = true
 	}
 
+	// Pre-compute databaseUsers for each login (matching PowerShell behavior).
+	// Maps login ObjectIdentifier -> list of "userName@databaseName" strings.
+	loginDatabaseUsers := make(map[string][]string)
+	for _, db := range serverInfo.Databases {
+		for _, principal := range db.DatabasePrincipals {
+			if principal.ServerLogin != nil && principal.ServerLogin.ObjectIdentifier != "" {
+				entry := fmt.Sprintf("%s@%s", principal.Name, db.Name)
+				loginDatabaseUsers[principal.ServerLogin.ObjectIdentifier] = append(
+					loginDatabaseUsers[principal.ServerLogin.ObjectIdentifier], entry)
+			}
+		}
+	}
+
 	// Create server principal nodes
 	for _, principal := range serverInfo.ServerPrincipals {
-		node := c.createServerPrincipalNode(&principal, serverInfo)
+		node := c.createServerPrincipalNode(&principal, serverInfo, loginDatabaseUsers)
 		if err := writer.WriteNode(node); err != nil {
 			return err
 		}
@@ -1747,9 +1782,14 @@ func (c *Collector) createServerNode(info *types.ServerInfo) *bloodhound.Node {
 		props["servicePrincipalNames"] = info.SPNs
 	}
 
-	// Add service account name (first service account, matching PowerShell)
+	// Add service account name (first service account, matching PowerShell behavior).
+	// PS strips the domain prefix via Resolve-DomainPrincipal which returns bare SAMAccountName.
 	if len(info.ServiceAccounts) > 0 {
-		props["serviceAccount"] = info.ServiceAccounts[0].Name
+		saName := info.ServiceAccounts[0].Name
+		if idx := strings.Index(saName, "\\"); idx != -1 {
+			saName = saName[idx+1:]
+		}
+		props["serviceAccount"] = saName
 	}
 
 	// Add database names
@@ -1770,7 +1810,24 @@ func (c *Collector) createServerNode(info *types.ServerInfo) *bloodhound.Node {
 		props["linkedToServers"] = linkedNames
 	}
 
-	// Calculate domain principals with privileged access
+	// Check if any linked servers resolve back to this server (self-reference).
+	// If so, merge the linked server target properties into this node to avoid
+	// creating a duplicate node with the same ObjectIdentifier.
+	hasLinksFromServers := []string{}
+	for _, ls := range info.LinkedServers {
+		if ls.ResolvedObjectIdentifier == info.ObjectIdentifier && ls.DataSource != "" {
+			hasLinksFromServers = append(hasLinksFromServers, info.ObjectIdentifier)
+			break
+		}
+	}
+	if len(hasLinksFromServers) > 0 {
+		props["isLinkedServerTarget"] = true
+		props["hasLinksFromServers"] = hasLinksFromServers
+	}
+
+	// Calculate domain principals with privileged access using effective permission
+	// evaluation (including nested role membership and fixed role implied permissions).
+	// This matches PowerShell's approach where sysadmin implies CONTROL SERVER.
 	domainPrincipalsWithSysadmin := []string{}
 	domainPrincipalsWithControlServer := []string{}
 	domainPrincipalsWithSecurityadmin := []string{}
@@ -1787,27 +1844,18 @@ func (c *Collector) createServerNode(info *types.ServerInfo) *bloodhound.Node {
 			continue
 		}
 
-		// Check role memberships
-		for _, membership := range principal.MemberOf {
-			switch membership.Name {
-			case "sysadmin":
-				domainPrincipalsWithSysadmin = append(domainPrincipalsWithSysadmin, principal.ObjectIdentifier)
-			case "securityadmin":
-				domainPrincipalsWithSecurityadmin = append(domainPrincipalsWithSecurityadmin, principal.ObjectIdentifier)
-			}
+		// Use effective permission/role checks (including nested roles and fixed role implied permissions)
+		if c.hasNestedRoleMembership(principal, "sysadmin", info) {
+			domainPrincipalsWithSysadmin = append(domainPrincipalsWithSysadmin, principal.ObjectIdentifier)
 		}
-
-		// Check explicit permissions
-		for _, perm := range principal.Permissions {
-			if perm.State != "GRANT" && perm.State != "GRANT_WITH_GRANT_OPTION" {
-				continue
-			}
-			switch perm.Permission {
-			case "CONTROL SERVER":
-				domainPrincipalsWithControlServer = append(domainPrincipalsWithControlServer, principal.ObjectIdentifier)
-			case "IMPERSONATE ANY LOGIN":
-				domainPrincipalsWithImpersonateAnyLogin = append(domainPrincipalsWithImpersonateAnyLogin, principal.ObjectIdentifier)
-			}
+		if c.hasNestedRoleMembership(principal, "securityadmin", info) {
+			domainPrincipalsWithSecurityadmin = append(domainPrincipalsWithSecurityadmin, principal.ObjectIdentifier)
+		}
+		if c.hasEffectivePermission(principal, "CONTROL SERVER", info) {
+			domainPrincipalsWithControlServer = append(domainPrincipalsWithControlServer, principal.ObjectIdentifier)
+		}
+		if c.hasEffectivePermission(principal, "IMPERSONATE ANY LOGIN", info) {
+			domainPrincipalsWithImpersonateAnyLogin = append(domainPrincipalsWithImpersonateAnyLogin, principal.ObjectIdentifier)
 		}
 	}
 
@@ -1826,7 +1874,7 @@ func (c *Collector) createServerNode(info *types.ServerInfo) *bloodhound.Node {
 }
 
 // createServerPrincipalNode creates a BloodHound node for a server principal
-func (c *Collector) createServerPrincipalNode(principal *types.ServerPrincipal, serverInfo *types.ServerInfo) *bloodhound.Node {
+func (c *Collector) createServerPrincipalNode(principal *types.ServerPrincipal, serverInfo *types.ServerInfo, loginDatabaseUsers map[string][]string) *bloodhound.Node {
 	props := map[string]interface{}{
 		"name":        principal.Name,
 		"principalId": principal.PrincipalID,
@@ -1857,6 +1905,15 @@ func (c *Collector) createServerPrincipalNode(principal *types.ServerPrincipal, 
 
 		if principal.SecurityIdentifier != "" {
 			props["activeDirectorySID"] = principal.SecurityIdentifier
+			// Resolve SID to NTAccount-style name (matching PowerShell's activeDirectoryPrincipal)
+			if principal.IsActiveDirectoryPrincipal {
+				props["activeDirectoryPrincipal"] = principal.Name
+			}
+		}
+
+		// Add databaseUsers list (matching PowerShell behavior)
+		if dbUsers, ok := loginDatabaseUsers[principal.ObjectIdentifier]; ok && len(dbUsers) > 0 {
+			props["databaseUsers"] = dbUsers
 		}
 	}
 
@@ -1935,6 +1992,11 @@ func (c *Collector) createDatabasePrincipalNode(principal *types.DatabasePrincip
 	var kinds []string
 	var icon *bloodhound.Icon
 
+	// Add defaultSchema for all database principal types (matching PowerShell behavior)
+	if principal.DefaultSchemaName != "" {
+		props["defaultSchema"] = principal.DefaultSchemaName
+	}
+
 	switch principal.TypeDescription {
 	case "DATABASE_ROLE":
 		kinds = []string{bloodhound.NodeKinds.DatabaseRole}
@@ -1951,9 +2013,6 @@ func (c *Collector) createDatabasePrincipalNode(principal *types.DatabasePrincip
 		kinds = []string{bloodhound.NodeKinds.DatabaseUser}
 		icon = bloodhound.CopyIcon(bloodhound.Icons[bloodhound.NodeKinds.DatabaseUser])
 		props["type"] = principal.TypeDescription
-		if principal.DefaultSchemaName != "" {
-			props["defaultSchema"] = principal.DefaultSchemaName
-		}
 		if principal.ServerLogin != nil {
 			props["serverLogin"] = principal.ServerLogin.Name
 		}
@@ -2060,6 +2119,29 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 		}
 	}
 
+	// Resolve domain login SIDs via LDAP for AD enrichment (matching PowerShell behavior).
+	// This provides properties like SAMAccountName, distinguishedName, DNSHostName, etc.
+	resolvedPrincipals := make(map[string]*types.DomainPrincipal)
+	if c.config.Domain != "" {
+		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+		for _, principal := range serverInfo.ServerPrincipals {
+			if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
+				continue
+			}
+			if !strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") {
+				continue
+			}
+			if _, already := resolvedPrincipals[principal.SecurityIdentifier]; already {
+				continue
+			}
+			resolved, err := adClient.ResolveSID(principal.SecurityIdentifier)
+			if err == nil && resolved != nil {
+				resolvedPrincipals[principal.SecurityIdentifier] = resolved
+			}
+		}
+		adClient.Close()
+	}
+
 	// Create nodes for domain principals with SQL logins
 	for _, principal := range serverInfo.ServerPrincipals {
 		if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
@@ -2119,12 +2201,32 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 			displayName = principal.Name + "@" + c.config.Domain
 		}
 
+		nodeProps := map[string]interface{}{
+			"name":              displayName,
+			"isDomainPrincipal": true,
+			"SID":               principal.SecurityIdentifier,
+		}
+
+		// Enrich with LDAP-resolved AD attributes (matching PowerShell behavior)
+		if resolved, ok := resolvedPrincipals[principal.SecurityIdentifier]; ok {
+			nodeProps["SAMAccountName"] = resolved.SAMAccountName
+			nodeProps["domain"] = resolved.Domain
+			nodeProps["isEnabled"] = resolved.Enabled
+			if resolved.DistinguishedName != "" {
+				nodeProps["distinguishedName"] = resolved.DistinguishedName
+			}
+			if resolved.DNSHostName != "" {
+				nodeProps["DNSHostName"] = resolved.DNSHostName
+			}
+			if resolved.UserPrincipalName != "" {
+				nodeProps["userPrincipalName"] = resolved.UserPrincipalName
+			}
+		}
+
 		node := &bloodhound.Node{
-			ID:    principal.SecurityIdentifier,
-			Kinds: kinds,
-			Properties: map[string]interface{}{
-				"name": displayName,
-			},
+			ID:         principal.SecurityIdentifier,
+			Kinds:      kinds,
+			Properties: nodeProps,
 		}
 		if err := writer.WriteNode(node); err != nil {
 			return err
@@ -2132,14 +2234,25 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 		createdNodes[principal.SecurityIdentifier] = true
 	}
 
-	// Create nodes for well-known local groups (S-1-5-32-*) with SQL logins
+	// Create nodes for local groups with SQL logins
+	// This handles both BUILTIN groups (S-1-5-32-*) and machine-local groups
+	// (S-1-5-21-* SIDs that don't match the domain SID, e.g. ConfigMgr_DViewAccess)
 	for _, principal := range serverInfo.ServerPrincipals {
 		if principal.SecurityIdentifier == "" {
 			continue
 		}
 
-		// Only process well-known local group SIDs (S-1-5-32-*)
-		if !strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-32-") {
+		// Identify local groups: BUILTIN (S-1-5-32-*) or machine-local Windows groups
+		// Machine-local groups have S-1-5-21-* SIDs belonging to the machine, not the domain
+		isLocalGroup := false
+		if strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-32-") {
+			isLocalGroup = true
+		} else if principal.TypeDescription == "WINDOWS_GROUP" &&
+			strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") &&
+			(serverInfo.DomainSID == "" || !strings.HasPrefix(principal.SecurityIdentifier, serverInfo.DomainSID+"-")) {
+			isLocalGroup = true
+		}
+		if !isLocalGroup {
 			continue
 		}
 
@@ -2223,17 +2336,113 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 			displayName = displayName[idx+1:]
 		}
 
+		nodeProps := map[string]interface{}{
+			"name": displayName,
+		}
+
+		// Enrich with LDAP-resolved AD attributes (matching PowerShell behavior)
+		if sa.ResolvedPrincipal != nil {
+			nodeProps["isDomainPrincipal"] = true
+			nodeProps["SID"] = sa.ResolvedPrincipal.SID
+			nodeProps["SAMAccountName"] = sa.ResolvedPrincipal.SAMAccountName
+			nodeProps["domain"] = sa.ResolvedPrincipal.Domain
+			nodeProps["isEnabled"] = sa.ResolvedPrincipal.Enabled
+			if sa.ResolvedPrincipal.DistinguishedName != "" {
+				nodeProps["distinguishedName"] = sa.ResolvedPrincipal.DistinguishedName
+			}
+			if sa.ResolvedPrincipal.DNSHostName != "" {
+				nodeProps["DNSHostName"] = sa.ResolvedPrincipal.DNSHostName
+			}
+			if sa.ResolvedPrincipal.UserPrincipalName != "" {
+				nodeProps["userPrincipalName"] = sa.ResolvedPrincipal.UserPrincipalName
+			}
+		}
+
 		node := &bloodhound.Node{
-			ID:    saID,
-			Kinds: kinds,
-			Properties: map[string]interface{}{
-				"name": displayName,
-			},
+			ID:         saID,
+			Kinds:      kinds,
+			Properties: nodeProps,
 		}
 		if err := writer.WriteNode(node); err != nil {
 			return err
 		}
 		createdNodes[saID] = true
+	}
+
+	// Create nodes for credential targets (HasMappedCred, HasDBScopedCred, HasProxyCred)
+	// This matches PowerShell's credential Base node creation at MSSQLHound.ps1:8958-9018
+	credentialNodeKind := func(objectClass string) string {
+		switch objectClass {
+		case "computer":
+			return bloodhound.NodeKinds.Computer
+		case "group":
+			return bloodhound.NodeKinds.Group
+		default:
+			return bloodhound.NodeKinds.User
+		}
+	}
+
+	writeCredentialNode := func(sid string, principal *types.DomainPrincipal) error {
+		if sid == "" || createdNodes[sid] {
+			return nil
+		}
+		kind := credentialNodeKind(principal.ObjectClass)
+		props := map[string]interface{}{
+			"name":              principal.Name,
+			"domain":            principal.Domain,
+			"isDomainPrincipal": true,
+			"SID":               principal.SID,
+			"SAMAccountName":    principal.SAMAccountName,
+			"isEnabled":         principal.Enabled,
+		}
+		if principal.DistinguishedName != "" {
+			props["distinguishedName"] = principal.DistinguishedName
+		}
+		if principal.DNSHostName != "" {
+			props["DNSHostName"] = principal.DNSHostName
+		}
+		if principal.UserPrincipalName != "" {
+			props["userPrincipalName"] = principal.UserPrincipalName
+		}
+		node := &bloodhound.Node{
+			ID:         sid,
+			Kinds:      []string{kind, "Base"},
+			Properties: props,
+		}
+		if err := writer.WriteNode(node); err != nil {
+			return err
+		}
+		createdNodes[sid] = true
+		return nil
+	}
+
+	// Server-level credentials
+	for _, cred := range serverInfo.Credentials {
+		if cred.ResolvedPrincipal != nil {
+			if err := writeCredentialNode(cred.ResolvedSID, cred.ResolvedPrincipal); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Database-scoped credentials
+	for _, db := range serverInfo.Databases {
+		for _, cred := range db.DBScopedCredentials {
+			if cred.ResolvedPrincipal != nil {
+				if err := writeCredentialNode(cred.ResolvedSID, cred.ResolvedPrincipal); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// Proxy account credentials
+	for _, proxy := range serverInfo.ProxyAccounts {
+		if proxy.ResolvedPrincipal != nil {
+			if err := writeCredentialNode(proxy.ResolvedSID, proxy.ResolvedPrincipal); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -2834,14 +3043,23 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 			}
 		}
 	} else {
-		// Fallback: process BUILTIN groups from ServerPrincipals if LocalGroupsWithLogins is not populated
+		// Fallback: process local groups from ServerPrincipals if LocalGroupsWithLogins is not populated
+		// This handles both BUILTIN (S-1-5-32-*) and machine-local groups (S-1-5-21-* not matching domain SID)
 		for _, principal := range serverInfo.ServerPrincipals {
 			if principal.SecurityIdentifier == "" {
 				continue
 			}
 
-			// Only process well-known local group SIDs (S-1-5-32-*)
-			if !strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-32-") {
+			// Identify local groups: BUILTIN (S-1-5-32-*) or machine-local Windows groups
+			isLocalGroup := false
+			if strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-32-") {
+				isLocalGroup = true
+			} else if principal.TypeDescription == "WINDOWS_GROUP" &&
+				strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") &&
+				(serverInfo.DomainSID == "" || !strings.HasPrefix(principal.SecurityIdentifier, serverInfo.DomainSID+"-")) {
+				isLocalGroup = true
+			}
+			if !isLocalGroup {
 				continue
 			}
 
@@ -3075,6 +3293,12 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 	// CREDENTIAL EDGES
 	// =========================================================================
 
+	// Build credential lookup map for enriching edge properties with dates
+	credentialByID := make(map[int]*types.Credential)
+	for i := range serverInfo.Credentials {
+		credentialByID[serverInfo.Credentials[i].CredentialID] = &serverInfo.Credentials[i]
+	}
+
 	// Create HasMappedCred edges from logins to their mapped credentials
 	for _, principal := range serverInfo.ServerPrincipals {
 		if principal.MappedCredential == nil {
@@ -3083,17 +3307,13 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 
 		cred := principal.MappedCredential
 
-		// Only create edges for domain credentials (has backslash or @ in identity)
-		if !strings.Contains(cred.CredentialIdentity, "\\") && !strings.Contains(cred.CredentialIdentity, "@") {
+		// Only create edges for domain credentials with a resolved SID,
+		// matching PowerShell's IsDomainPrincipal && ResolvedSID check
+		if cred.ResolvedSID == "" {
 			continue
 		}
 
-		// Use ResolvedSID if available, fall back to CredentialIdentity
-		// PowerShell uses the resolved SID as the edge target
-		targetID := cred.CredentialIdentity
-		if cred.ResolvedSID != "" {
-			targetID = cred.ResolvedSID
-		}
+		targetID := cred.ResolvedSID
 
 		// HasMappedCred: Login -> AD Principal (resolved SID or credential identity)
 		edge := c.createEdge(
@@ -3108,6 +3328,17 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				SQLServerName: serverInfo.SQLServerName,
 			},
 		)
+		if edge != nil {
+			edge.Properties["credentialId"] = cred.CredentialID
+			edge.Properties["credentialIdentity"] = cred.CredentialIdentity
+			edge.Properties["credentialName"] = cred.Name
+			edge.Properties["resolvedSid"] = cred.ResolvedSID
+			// Get createDate/modifyDate from the standalone credentials list
+			if fullCred, ok := credentialByID[cred.CredentialID]; ok {
+				edge.Properties["createDate"] = fullCred.CreateDate.Format(time.RFC3339)
+				edge.Properties["modifyDate"] = fullCred.ModifyDate.Format(time.RFC3339)
+			}
+		}
 		if err := writer.WriteEdge(edge); err != nil {
 			return err
 		}
@@ -3119,8 +3350,9 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 
 	// Create HasProxyCred edges from logins authorized to use proxies
 	for _, proxy := range serverInfo.ProxyAccounts {
-		// Only create edges for domain credentials
-		if !strings.Contains(proxy.CredentialIdentity, "\\") && !strings.Contains(proxy.CredentialIdentity, "@") {
+		// Only create edges for domain credentials with a resolved SID,
+		// matching PowerShell's IsDomainPrincipal && ResolvedSID check
+		if proxy.ResolvedSID == "" {
 			continue
 		}
 
@@ -3139,11 +3371,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				continue
 			}
 
-			// Use ResolvedSID if available, fall back to CredentialIdentity
-			proxyTargetID := proxy.CredentialIdentity
-			if proxy.ResolvedSID != "" {
-				proxyTargetID = proxy.ResolvedSID
-			}
+			proxyTargetID := proxy.ResolvedSID
 
 			// HasProxyCred: Login -> AD Principal (resolved SID or credential identity)
 			edge := c.createEdge(
@@ -3158,6 +3386,21 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					SQLServerName: serverInfo.SQLServerName,
 				},
 			)
+			if edge != nil {
+				edge.Properties["authorizedPrincipals"] = strings.Join(proxy.Logins, ", ")
+				edge.Properties["credentialId"] = proxy.CredentialID
+				edge.Properties["credentialIdentity"] = proxy.CredentialIdentity
+				edge.Properties["credentialName"] = proxy.CredentialName
+				edge.Properties["description"] = proxy.Description
+				edge.Properties["isEnabled"] = proxy.Enabled
+				edge.Properties["proxyId"] = proxy.ProxyID
+				edge.Properties["proxyName"] = proxy.Name
+				edge.Properties["resolvedSid"] = proxy.ResolvedSID
+				edge.Properties["subsystems"] = strings.Join(proxy.Subsystems, ", ")
+				if proxy.ResolvedPrincipal != nil {
+					edge.Properties["resolvedType"] = proxy.ResolvedPrincipal.ObjectClass
+				}
+			}
 			if err := writer.WriteEdge(edge); err != nil {
 				return err
 			}
@@ -3171,16 +3414,13 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 	// Create HasDBScopedCred edges from databases to credential identities
 	for _, db := range serverInfo.Databases {
 		for _, cred := range db.DBScopedCredentials {
-			// Only create edges for domain credentials
-			if !strings.Contains(cred.CredentialIdentity, "\\") && !strings.Contains(cred.CredentialIdentity, "@") {
+			// Only create edges for domain credentials with a resolved SID,
+			// matching PowerShell's IsDomainPrincipal && ResolvedSID check
+			if cred.ResolvedSID == "" {
 				continue
 			}
 
-			// Use ResolvedSID if available, fall back to CredentialIdentity
-			dbCredTargetID := cred.CredentialIdentity
-			if cred.ResolvedSID != "" {
-				dbCredTargetID = cred.ResolvedSID
-			}
+			dbCredTargetID := cred.ResolvedSID
 
 			// HasDBScopedCred: Database -> AD Principal (resolved SID or credential identity)
 			edge := c.createEdge(
@@ -3196,6 +3436,15 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					DatabaseName:  db.Name,
 				},
 			)
+			if edge != nil {
+				edge.Properties["credentialId"] = cred.CredentialID
+				edge.Properties["credentialIdentity"] = cred.CredentialIdentity
+				edge.Properties["credentialName"] = cred.Name
+				edge.Properties["createDate"] = cred.CreateDate.Format(time.RFC3339)
+				edge.Properties["database"] = db.Name
+				edge.Properties["modifyDate"] = cred.ModifyDate.Format(time.RFC3339)
+				edge.Properties["resolvedSid"] = cred.ResolvedSID
+			}
 			if err := writer.WriteEdge(edge); err != nil {
 				return err
 			}
@@ -3246,9 +3495,21 @@ func (c *Collector) hasNestedRoleMembershipDFS(memberOf []types.RoleMembership, 
 	return false
 }
 
-// hasEffectivePermission checks if a server principal has a permission, either directly
-// or inherited through role membership chains (BFS traversal).
-// This matches PowerShell's Get-EffectivePermissions function.
+// fixedServerRolePermissions maps fixed server roles to their implied permissions,
+// matching PowerShell's $fixedServerRolePermissions. These are permissions that
+// are not explicitly granted in sys.server_permissions but are inherent to the role.
+var fixedServerRolePermissions = map[string][]string{
+	// sysadmin implicitly has all permissions; CONTROL SERVER is the effective grant
+	"sysadmin": {"CONTROL SERVER"},
+	// securityadmin can manage logins
+	"securityadmin": {"ALTER ANY LOGIN"},
+}
+
+// hasEffectivePermission checks if a server principal has a permission, either directly,
+// inherited through role membership chains (BFS traversal), or implied by fixed role
+// membership (e.g., sysadmin implies CONTROL SERVER).
+// This matches PowerShell's Get-EffectivePermissions function combined with
+// $fixedServerRolePermissions logic.
 func (c *Collector) hasEffectivePermission(principal types.ServerPrincipal, targetPermission string, serverInfo *types.ServerInfo) bool {
 	// First check direct permissions (skip DENY)
 	for _, perm := range principal.Permissions {
@@ -3281,6 +3542,15 @@ func (c *Collector) hasEffectivePermission(principal types.ServerPrincipal, targ
 			continue
 		}
 		checked[currentRoleName] = true
+
+		// Check fixed role implied permissions (e.g., sysadmin -> CONTROL SERVER)
+		if impliedPerms, ok := fixedServerRolePermissions[currentRoleName]; ok {
+			for _, impliedPerm := range impliedPerms {
+				if impliedPerm == targetPermission {
+					return true
+				}
+			}
+		}
 
 		// Find the role in server principals
 		for _, sp := range serverInfo.ServerPrincipals {

@@ -365,7 +365,7 @@ This helps identify whether the issue is TLS-related or authentication-related.
 
 ## License
 
-MIT License - see LICENSE file.
+GPLv3 License - see LICENSE file.
 
 ## Credits
 

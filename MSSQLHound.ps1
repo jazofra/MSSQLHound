@@ -9467,7 +9467,6 @@ ORDER BY p.proxy_id
                                         # Not possible to grant a principal ALTER on fixed roles, so we don't need to check for fixed/user-defined
                                         switch ($script:CurrentEdgeContext.targetPrincipal.TypeDescription) {
                                             "DATABASE_ROLE" {
-                                                Add-Edge -Kind "MSSQL_Alter"
                                                 Add-Edge -Kind "MSSQL_AddMember"
                                             }
                                             "APPLICATION_ROLE" {
@@ -10116,10 +10115,14 @@ ORDER BY p.proxy_id
                             -Target $groupPrincipal.ObjectIdentifier `
                             -Kind "MSSQL_HasLogin"
                     
-                    # Add edges for group members
-                    Add-Edge -Source $member.SID `
-                            -Target $groupObjectId `
-                            -Kind "MemberOf"
+                    # Add MemberOf edges for group members
+                    foreach ($member in $groupInfo.Members) {
+                        if ($member.SID) {
+                            Add-Edge -Source $member.SID `
+                                    -Target $groupObjectId `
+                                    -Kind "MemberOf"
+                        }
+                    }
 
                 } else {
                     Write-Verbose "Skipping local group $($groupPrincipal.Name) because SID was not found"

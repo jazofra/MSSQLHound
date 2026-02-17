@@ -49,6 +49,7 @@ type StreamingWriter struct {
 	firstEdge bool
 	inEdges   bool
 	filePath  string
+	seenEdges map[string]bool // dedup: "source|target|kind"
 }
 
 // NewStreamingWriter creates a new streaming BloodHound JSON writer
@@ -69,6 +70,7 @@ func NewStreamingWriter(filePath string) (*StreamingWriter, error) {
 		firstNode: true,
 		firstEdge: true,
 		filePath:  filePath,
+		seenEdges: make(map[string]bool),
 	}
 
 	// Write header
@@ -128,7 +130,7 @@ func (w *StreamingWriter) WriteNode(node *Node) error {
 	return nil
 }
 
-// WriteEdge writes a single edge to the output. If edge is nil, it is silently skipped.
+// WriteEdge writes a single edge to the output. If edge is nil or a duplicate, it is silently skipped.
 func (w *StreamingWriter) WriteEdge(edge *Edge) error {
 	if edge == nil {
 		return nil
@@ -136,6 +138,20 @@ func (w *StreamingWriter) WriteEdge(edge *Edge) error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	// Deduplicate by full edge content (JSON-serialized).
+	// This ensures truly identical edges (same source, target, kind, AND properties)
+	// are deduped, while edges with same source/target/kind but different properties
+	// (e.g., LinkedTo edges with different localLogin mappings) are kept.
+	edgeJSON, err := json.Marshal(edge)
+	if err != nil {
+		return err
+	}
+	edgeKey := string(edgeJSON)
+	if w.seenEdges[edgeKey] {
+		return nil
+	}
+	w.seenEdges[edgeKey] = true
 
 	// Transition from nodes to edges if needed
 	if !w.inEdges {

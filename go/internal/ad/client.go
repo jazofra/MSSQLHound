@@ -642,13 +642,16 @@ func (c *Client) ResolveSID(sid string) (*types.DomainPrincipal, error) {
 		principal.Enabled = !strings.Contains(uac, "2")
 	}
 
+	// Store raw LDAP attributes for AD enrichment on nodes
+	dnsHostName := entry.GetAttributeValue("dNSHostName")
+	userPrincipalName := entry.GetAttributeValue("userPrincipalName")
+	principal.DNSHostName = dnsHostName
+	principal.UserPrincipalName = userPrincipalName
+
 	// Set the Name based on object class to match PowerShell behavior:
 	// - For computers: use DNSHostName (FQDN) if available, otherwise SAMAccountName
 	// - For users: use userPrincipalName if available, otherwise DOMAIN\SAMAccountName
 	// - For groups: use DOMAIN\SAMAccountName
-	dnsHostName := entry.GetAttributeValue("dNSHostName")
-	userPrincipalName := entry.GetAttributeValue("userPrincipalName")
-
 	switch principal.ObjectClass {
 	case "computer":
 		if dnsHostName != "" {
@@ -739,10 +742,13 @@ func (c *Client) ResolveName(name string) (*types.DomainPrincipal, error) {
 		}
 	}
 
-	// Set the Name based on object class to match PowerShell behavior
+	// Store raw LDAP attributes for AD enrichment on nodes
 	dnsHostName := entry.GetAttributeValue("dNSHostName")
 	userPrincipalName := entry.GetAttributeValue("userPrincipalName")
+	principal.DNSHostName = dnsHostName
+	principal.UserPrincipalName = userPrincipalName
 
+	// Set the Name based on object class to match PowerShell behavior
 	switch principal.ObjectClass {
 	case "computer":
 		if dnsHostName != "" {
