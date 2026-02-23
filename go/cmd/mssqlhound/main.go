@@ -138,6 +138,17 @@ func run(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// If LDAP credentials not specified but SQL credentials look like domain credentials,
+	// use the SQL credentials for LDAP authentication as a fallback
+	effectiveLDAPUser := ldapUser
+	effectiveLDAPPassword := ldapPassword
+	if effectiveLDAPUser == "" && effectiveLDAPPassword == "" && userID != "" && password != "" {
+		if strings.Contains(userID, "\\") || strings.Contains(userID, "@") {
+			effectiveLDAPUser = userID
+			effectiveLDAPPassword = password
+		}
+	}
+
 	// Build configuration from flags
 	config := &collector.Config{
 		ServerInstance:                  serverInstance,
@@ -149,8 +160,8 @@ func run(cmd *cobra.Command, args []string) error {
 		DomainController:                domainController,
 		DCIP:                            dcIP,
 		DNSResolver:                     dnsResolver,
-		LDAPUser:                        ldapUser,
-		LDAPPassword:                    ldapPassword,
+		LDAPUser:                        effectiveLDAPUser,
+		LDAPPassword:                    effectiveLDAPPassword,
 		OutputFormat:                    outputFormat,
 		TempDir:                         tempDir,
 		ZipDir:                          zipDir,

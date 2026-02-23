@@ -2461,10 +2461,11 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 			db.ObjectIdentifier,
 			bloodhound.EdgeKinds.Contains,
 			&bloodhound.EdgeContext{
-				SourceName: serverInfo.ServerName,
-				SourceType: bloodhound.NodeKinds.Server,
-				TargetName: db.Name,
-				TargetType: bloodhound.NodeKinds.Database,
+				SourceName:  serverInfo.ServerName,
+				SourceType:  bloodhound.NodeKinds.Server,
+				TargetName:  db.Name,
+				TargetType:  bloodhound.NodeKinds.Database,
+				SQLServerID: serverInfo.ObjectIdentifier,
 			},
 		)
 		if err := writer.WriteEdge(edge); err != nil {
@@ -2480,10 +2481,11 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 			principal.ObjectIdentifier,
 			bloodhound.EdgeKinds.Contains,
 			&bloodhound.EdgeContext{
-				SourceName: serverInfo.ServerName,
-				SourceType: bloodhound.NodeKinds.Server,
-				TargetName: principal.Name,
-				TargetType: targetType,
+				SourceName:  serverInfo.ServerName,
+				SourceType:  bloodhound.NodeKinds.Server,
+				TargetName:  principal.Name,
+				TargetType:  targetType,
+				SQLServerID: serverInfo.ObjectIdentifier,
 			},
 		)
 		if err := writer.WriteEdge(edge); err != nil {
@@ -2505,6 +2507,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    principal.Name,
 					TargetType:    targetType,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 					DatabaseName:  db.Name,
 				},
 			)
@@ -2531,6 +2534,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    db.Name,
 					TargetType:    bloodhound.NodeKinds.Database,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -2539,19 +2543,30 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 		}
 	}
 
-	// Server role ownership
+	// Server role ownership - look up owner's actual type
+	serverPrincipalTypeMap := make(map[string]string)
+	for _, p := range serverInfo.ServerPrincipals {
+		serverPrincipalTypeMap[p.ObjectIdentifier] = p.TypeDescription
+	}
 	for _, principal := range serverInfo.ServerPrincipals {
 		if principal.TypeDescription == "SERVER_ROLE" && principal.OwningObjectIdentifier != "" {
+			ownerType := bloodhound.NodeKinds.Login // default for server-level
+			if td, ok := serverPrincipalTypeMap[principal.OwningObjectIdentifier]; ok {
+				if td == "SERVER_ROLE" {
+					ownerType = bloodhound.NodeKinds.ServerRole
+				}
+			}
 			edge := c.createEdge(
 				principal.OwningObjectIdentifier,
 				principal.ObjectIdentifier,
 				bloodhound.EdgeKinds.Owns,
 				&bloodhound.EdgeContext{
 					SourceName:    "", // Will be filled by owner lookup
-					SourceType:    bloodhound.NodeKinds.Login,
+					SourceType:    ownerType,
 					TargetName:    principal.Name,
 					TargetType:    bloodhound.NodeKinds.ServerRole,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -2560,20 +2575,34 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 		}
 	}
 
-	// Database role ownership
+	// Database role ownership - look up owner's actual type
 	for _, db := range serverInfo.Databases {
+		dbPrincipalTypeMap := make(map[string]string)
+		for _, p := range db.DatabasePrincipals {
+			dbPrincipalTypeMap[p.ObjectIdentifier] = p.TypeDescription
+		}
 		for _, principal := range db.DatabasePrincipals {
 			if principal.TypeDescription == "DATABASE_ROLE" && principal.OwningObjectIdentifier != "" {
+				ownerType := bloodhound.NodeKinds.DatabaseUser // default for db-level
+				if td, ok := dbPrincipalTypeMap[principal.OwningObjectIdentifier]; ok {
+					switch td {
+					case "DATABASE_ROLE":
+						ownerType = bloodhound.NodeKinds.DatabaseRole
+					case "APPLICATION_ROLE":
+						ownerType = bloodhound.NodeKinds.ApplicationRole
+					}
+				}
 				edge := c.createEdge(
 					principal.OwningObjectIdentifier,
 					principal.ObjectIdentifier,
 					bloodhound.EdgeKinds.Owns,
 					&bloodhound.EdgeContext{
 						SourceName:    "", // Owner name
-						SourceType:    bloodhound.NodeKinds.DatabaseUser,
+						SourceType:    ownerType,
 						TargetName:    principal.Name,
 						TargetType:    bloodhound.NodeKinds.DatabaseRole,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						DatabaseName:  db.Name,
 					},
 				)
@@ -2601,6 +2630,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    role.Name,
 					TargetType:    bloodhound.NodeKinds.ServerRole,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -2623,6 +2653,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 						TargetName:    role.Name,
 						TargetType:    bloodhound.NodeKinds.DatabaseRole,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						DatabaseName:  db.Name,
 					},
 				)
@@ -2651,6 +2682,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 						TargetName:    principal.Name,
 						TargetType:    bloodhound.NodeKinds.DatabaseUser,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						DatabaseName:  db.Name,
 					},
 				)
@@ -2720,6 +2752,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				TargetName:    linked.Name,
 				TargetType:    bloodhound.NodeKinds.Server,
 				SQLServerName: serverInfo.SQLServerName,
+				SQLServerID:   serverInfo.ObjectIdentifier,
 			},
 		)
 		if edge != nil {
@@ -2764,6 +2797,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    linked.Name,
 					TargetType:    bloodhound.NodeKinds.Server,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if edge != nil {
@@ -2804,6 +2838,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    serverInfo.ServerName,
 					TargetType:    bloodhound.NodeKinds.Server,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -2840,6 +2875,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 							TargetName:    serverInfo.SQLServerName,
 							TargetType:    bloodhound.NodeKinds.Server,
 							SQLServerName: serverInfo.SQLServerName,
+							SQLServerID:   serverInfo.ObjectIdentifier,
 							DatabaseName:  db.Name,
 						},
 					)
@@ -2852,7 +2888,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 						edge.Properties["ownerHasSysadmin"] = ownerHasSysadmin
 						edge.Properties["ownerLoginName"] = ownerLoginName
 						edge.Properties["ownerObjectIdentifier"] = db.OwnerObjectIdentifier
-						edge.Properties["ownerPrincipalID"] = db.OwnerPrincipalID
+						edge.Properties["ownerPrincipalID"] = fmt.Sprintf("%d", db.OwnerPrincipalID)
 						edge.Properties["SQLServer"] = serverInfo.ObjectIdentifier
 					}
 					if err := writer.WriteEdge(edge); err != nil {
@@ -2880,6 +2916,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				TargetName:    serverInfo.SQLServerName,
 				TargetType:    bloodhound.NodeKinds.Server,
 				SQLServerName: serverInfo.SQLServerName,
+				SQLServerID:   serverInfo.ObjectIdentifier,
 			},
 		)
 		if err := writer.WriteEdge(edge); err != nil {
@@ -2897,6 +2934,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				TargetName:    serverInfo.Hostname,
 				TargetType:    "Computer",
 				SQLServerName: serverInfo.SQLServerName,
+				SQLServerID:   serverInfo.ObjectIdentifier,
 			},
 		)
 		if err := writer.WriteEdge(edge); err != nil {
@@ -2962,11 +3000,13 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				principal.ObjectIdentifier,
 				bloodhound.EdgeKinds.CoerceAndRelayTo,
 				&bloodhound.EdgeContext{
-					SourceName:    "AUTHENTICATED USERS",
-					SourceType:    "Group",
-					TargetName:    principal.Name,
-					TargetType:    bloodhound.NodeKinds.Login,
-					SQLServerName: serverInfo.SQLServerName,
+					SourceName:           "AUTHENTICATED USERS",
+					SourceType:           "Group",
+					TargetName:           principal.Name,
+					TargetType:           bloodhound.NodeKinds.Login,
+					SQLServerName:        serverInfo.SQLServerName,
+					SQLServerID:          serverInfo.ObjectIdentifier,
+					SecurityIdentifier:   principal.SecurityIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -2998,6 +3038,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				TargetName:    principal.Name,
 				TargetType:    bloodhound.NodeKinds.Login,
 				SQLServerName: serverInfo.SQLServerName,
+				SQLServerID:   serverInfo.ObjectIdentifier,
 			},
 		)
 		if err := writer.WriteEdge(edge); err != nil {
@@ -3036,6 +3077,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    principal.Name,
 					TargetType:    bloodhound.NodeKinds.Login,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -3109,6 +3151,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    principal.Name,
 					TargetType:    bloodhound.NodeKinds.Login,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -3123,8 +3166,13 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 
 	// Track domain principals with admin privileges for GetAdminTGS
 	// Uses nested role/permission checks matching PowerShell's second pass (lines 7676-7712)
-	var domainPrincipalsWithAdmin []string
+	// Track four separate categories matching PS1's domainPrincipalsWith* arrays
+	var domainPrincipalsWithSysadmin []string
+	var domainPrincipalsWithSecurityadmin []string
+	var domainPrincipalsWithControlServer []string
+	var domainPrincipalsWithImpersonateAnyLogin []string
 	var enabledDomainLoginsWithConnectSQL []types.ServerPrincipal
+	isAnyDomainPrincipalSysadmin := false
 
 	for _, principal := range serverInfo.ServerPrincipals {
 		if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
@@ -3136,14 +3184,22 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 			continue
 		}
 
-		// Check if has admin-level access (including inherited through nested role membership)
-		hasAdmin := c.hasNestedRoleMembership(principal, "sysadmin", serverInfo) ||
-			c.hasNestedRoleMembership(principal, "securityadmin", serverInfo) ||
-			c.hasEffectivePermission(principal, "CONTROL SERVER", serverInfo) ||
-			c.hasEffectivePermission(principal, "IMPERSONATE ANY LOGIN", serverInfo)
-
-		if hasAdmin {
-			domainPrincipalsWithAdmin = append(domainPrincipalsWithAdmin, principal.ObjectIdentifier)
+		// Check each admin-level access category separately (matching PS1)
+		if c.hasNestedRoleMembership(principal, "sysadmin", serverInfo) {
+			domainPrincipalsWithSysadmin = append(domainPrincipalsWithSysadmin, principal.ObjectIdentifier)
+			isAnyDomainPrincipalSysadmin = true
+		}
+		if c.hasNestedRoleMembership(principal, "securityadmin", serverInfo) {
+			domainPrincipalsWithSecurityadmin = append(domainPrincipalsWithSecurityadmin, principal.ObjectIdentifier)
+			isAnyDomainPrincipalSysadmin = true
+		}
+		if c.hasEffectivePermission(principal, "CONTROL SERVER", serverInfo) {
+			domainPrincipalsWithControlServer = append(domainPrincipalsWithControlServer, principal.ObjectIdentifier)
+			isAnyDomainPrincipalSysadmin = true
+		}
+		if c.hasEffectivePermission(principal, "IMPERSONATE ANY LOGIN", serverInfo) {
+			domainPrincipalsWithImpersonateAnyLogin = append(domainPrincipalsWithImpersonateAnyLogin, principal.ObjectIdentifier)
+			isAnyDomainPrincipalSysadmin = true
 		}
 
 		// Track enabled domain logins with CONNECT SQL for GetTGS
@@ -3217,6 +3273,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				TargetName:    serverInfo.SQLServerName,
 				TargetType:    bloodhound.NodeKinds.Server,
 				SQLServerName: serverInfo.SQLServerName,
+				SQLServerID:   serverInfo.ObjectIdentifier,
 			},
 		)
 		if err := writer.WriteEdge(edge); err != nil {
@@ -3243,6 +3300,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    sa.Name,
 					TargetType:    "Base",
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -3251,7 +3309,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 		}
 
 		// GetAdminTGS: Service Account -> Server (if any domain principal has admin)
-		if len(domainPrincipalsWithAdmin) > 0 {
+		if isAnyDomainPrincipalSysadmin {
 			edge := c.createEdge(
 				saID,
 				serverInfo.ObjectIdentifier,
@@ -3262,8 +3320,35 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    serverInfo.SQLServerName,
 					TargetType:    bloodhound.NodeKinds.Server,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
+			if edge != nil {
+				// Filter domainPrincipalsWith* to only include enabled logins with CONNECT SQL
+				// matching PS1 lines 9869-9900
+				enabledOIDs := make(map[string]bool)
+				for _, login := range enabledDomainLoginsWithConnectSQL {
+					enabledOIDs[login.ObjectIdentifier] = true
+				}
+
+				filterEnabled := func(ids []string) []string {
+					var filtered []string
+					for _, id := range ids {
+						if enabledOIDs[id] {
+							filtered = append(filtered, id)
+						}
+					}
+					if filtered == nil {
+						filtered = []string{}
+					}
+					return filtered
+				}
+
+				edge.Properties["domainPrincipalsWithControlServer"] = filterEnabled(domainPrincipalsWithControlServer)
+				edge.Properties["domainPrincipalsWithImpersonateAnyLogin"] = filterEnabled(domainPrincipalsWithImpersonateAnyLogin)
+				edge.Properties["domainPrincipalsWithSecurityadmin"] = filterEnabled(domainPrincipalsWithSecurityadmin)
+				edge.Properties["domainPrincipalsWithSysadmin"] = filterEnabled(domainPrincipalsWithSysadmin)
+			}
 			if err := writer.WriteEdge(edge); err != nil {
 				return err
 			}
@@ -3281,6 +3366,7 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    login.Name,
 					TargetType:    bloodhound.NodeKinds.Login,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -3326,17 +3412,18 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				TargetName:    cred.CredentialIdentity,
 				TargetType:    "Base",
 				SQLServerName: serverInfo.SQLServerName,
+				SQLServerID:   serverInfo.ObjectIdentifier,
 			},
 		)
 		if edge != nil {
-			edge.Properties["credentialId"] = cred.CredentialID
+			edge.Properties["credentialId"] = fmt.Sprintf("%d", cred.CredentialID)
 			edge.Properties["credentialIdentity"] = cred.CredentialIdentity
 			edge.Properties["credentialName"] = cred.Name
 			edge.Properties["resolvedSid"] = cred.ResolvedSID
 			// Get createDate/modifyDate from the standalone credentials list
 			if fullCred, ok := credentialByID[cred.CredentialID]; ok {
-				edge.Properties["createDate"] = fullCred.CreateDate.Format(time.RFC3339)
-				edge.Properties["modifyDate"] = fullCred.ModifyDate.Format(time.RFC3339)
+				edge.Properties["createDate"] = fullCred.CreateDate.Format("1/2/2006 3:04:05 PM")
+				edge.Properties["modifyDate"] = fullCred.ModifyDate.Format("1/2/2006 3:04:05 PM")
 			}
 		}
 		if err := writer.WriteEdge(edge); err != nil {
@@ -3379,26 +3466,34 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				proxyTargetID,
 				bloodhound.EdgeKinds.HasProxyCred,
 				&bloodhound.EdgeContext{
-					SourceName:    loginName,
-					SourceType:    bloodhound.NodeKinds.Login,
-					TargetName:    proxy.CredentialIdentity,
-					TargetType:    "Base",
-					SQLServerName: serverInfo.SQLServerName,
+					SourceName:           loginName,
+					SourceType:           bloodhound.NodeKinds.Login,
+					TargetName:           proxy.CredentialIdentity,
+					TargetType:           "Base",
+					SQLServerName:        serverInfo.SQLServerName,
+					SQLServerID:          serverInfo.ObjectIdentifier,
+					CredentialIdentity:   proxy.CredentialIdentity,
+					IsEnabled:            proxy.Enabled,
+					ProxyName:            proxy.Name,
 				},
 			)
 			if edge != nil {
 				edge.Properties["authorizedPrincipals"] = strings.Join(proxy.Logins, ", ")
-				edge.Properties["credentialId"] = proxy.CredentialID
+				edge.Properties["credentialId"] = fmt.Sprintf("%d", proxy.CredentialID)
 				edge.Properties["credentialIdentity"] = proxy.CredentialIdentity
 				edge.Properties["credentialName"] = proxy.CredentialName
 				edge.Properties["description"] = proxy.Description
 				edge.Properties["isEnabled"] = proxy.Enabled
-				edge.Properties["proxyId"] = proxy.ProxyID
+				edge.Properties["proxyId"] = fmt.Sprintf("%d", proxy.ProxyID)
 				edge.Properties["proxyName"] = proxy.Name
 				edge.Properties["resolvedSid"] = proxy.ResolvedSID
 				edge.Properties["subsystems"] = strings.Join(proxy.Subsystems, ", ")
 				if proxy.ResolvedPrincipal != nil {
-					edge.Properties["resolvedType"] = proxy.ResolvedPrincipal.ObjectClass
+					resolvedType := proxy.ResolvedPrincipal.ObjectClass
+				if len(resolvedType) > 0 {
+					resolvedType = strings.ToUpper(resolvedType[:1]) + resolvedType[1:]
+				}
+				edge.Properties["resolvedType"] = resolvedType
 				}
 			}
 			if err := writer.WriteEdge(edge); err != nil {
@@ -3433,16 +3528,17 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 					TargetName:    cred.CredentialIdentity,
 					TargetType:    "Base",
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 					DatabaseName:  db.Name,
 				},
 			)
 			if edge != nil {
-				edge.Properties["credentialId"] = cred.CredentialID
+				edge.Properties["credentialId"] = fmt.Sprintf("%d", cred.CredentialID)
 				edge.Properties["credentialIdentity"] = cred.CredentialIdentity
 				edge.Properties["credentialName"] = cred.Name
-				edge.Properties["createDate"] = cred.CreateDate.Format(time.RFC3339)
+				edge.Properties["createDate"] = cred.CreateDate.Format("1/2/2006 3:04:05 PM")
 				edge.Properties["database"] = db.Name
-				edge.Properties["modifyDate"] = cred.ModifyDate.Format(time.RFC3339)
+				edge.Properties["modifyDate"] = cred.ModifyDate.Format("1/2/2006 3:04:05 PM")
 				edge.Properties["resolvedSid"] = cred.ResolvedSID
 			}
 			if err := writer.WriteEdge(edge); err != nil {
@@ -3990,6 +4086,7 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 					TargetName:    serverInfo.ServerName,
 					TargetType:    bloodhound.NodeKinds.Server,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 					IsFixedRole:   true,
 				},
 			)
@@ -4009,6 +4106,7 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 					TargetName:    serverInfo.ServerName,
 					TargetType:    bloodhound.NodeKinds.Server,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 					IsFixedRole:   true,
 				},
 			)
@@ -4027,6 +4125,7 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 					TargetName:    serverInfo.ServerName,
 					TargetType:    bloodhound.NodeKinds.Server,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 					IsFixedRole:   true,
 				},
 			)
@@ -4061,12 +4160,14 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 						targetPrincipal.ObjectIdentifier,
 						bloodhound.EdgeKinds.ChangePassword,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    bloodhound.NodeKinds.ServerRole,
-							TargetName:    targetPrincipal.Name,
-							TargetType:    bloodhound.NodeKinds.Login,
-							SQLServerName: serverInfo.SQLServerName,
-							Permission:    "ALTER ANY LOGIN",
+							SourceName:             principal.Name,
+							SourceType:             bloodhound.NodeKinds.ServerRole,
+							TargetName:             targetPrincipal.Name,
+							TargetType:             bloodhound.NodeKinds.Login,
+							TargetTypeDescription:  targetPrincipal.TypeDescription,
+							SQLServerName:          serverInfo.SQLServerName,
+							SQLServerID:            serverInfo.ObjectIdentifier,
+							Permission:             "ALTER ANY LOGIN",
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4086,6 +4187,7 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 					TargetName:    serverInfo.ServerName,
 					TargetType:    bloodhound.NodeKinds.Server,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 					IsFixedRole:   true,
 				},
 			)
@@ -4119,12 +4221,14 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 						targetPrincipal.ObjectIdentifier,
 						bloodhound.EdgeKinds.ChangePassword,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    bloodhound.NodeKinds.ServerRole,
-							TargetName:    targetPrincipal.Name,
-							TargetType:    bloodhound.NodeKinds.Login,
-							SQLServerName: serverInfo.SQLServerName,
-							Permission:    "ALTER ANY LOGIN",
+							SourceName:            principal.Name,
+							SourceType:            bloodhound.NodeKinds.ServerRole,
+							TargetName:            targetPrincipal.Name,
+							TargetType:            bloodhound.NodeKinds.Login,
+							TargetTypeDescription: targetPrincipal.TypeDescription,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							Permission:            "ALTER ANY LOGIN",
 						},
 					)
 					if err := writer.WriteEdge(cpEdge); err != nil {
@@ -4145,6 +4249,7 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 					TargetName:    serverInfo.ServerName,
 					TargetType:    bloodhound.NodeKinds.Server,
 					SQLServerName: serverInfo.SQLServerName,
+					SQLServerID:   serverInfo.ObjectIdentifier,
 					IsFixedRole:   true,
 				},
 			)
@@ -4170,13 +4275,15 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 					db.ObjectIdentifier,
 					bloodhound.EdgeKinds.Control,
 					&bloodhound.EdgeContext{
-						SourceName:    principal.Name,
-						SourceType:    bloodhound.NodeKinds.DatabaseRole,
-						TargetName:    db.Name,
-						TargetType:    bloodhound.NodeKinds.Database,
-						SQLServerName: serverInfo.SQLServerName,
-						DatabaseName:  db.Name,
-						IsFixedRole:   true,
+						SourceName:            principal.Name,
+						SourceType:            bloodhound.NodeKinds.DatabaseRole,
+						TargetName:            db.Name,
+						TargetType:            bloodhound.NodeKinds.Database,
+						TargetTypeDescription: "DATABASE",
+						SQLServerName:         serverInfo.SQLServerName,
+						SQLServerID:           serverInfo.ObjectIdentifier,
+						DatabaseName:          db.Name,
+						IsFixedRole:           true,
 					},
 				)
 				if err := writer.WriteEdge(edge); err != nil {
@@ -4189,13 +4296,15 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 					db.ObjectIdentifier,
 					bloodhound.EdgeKinds.ControlDB,
 					&bloodhound.EdgeContext{
-						SourceName:    principal.Name,
-						SourceType:    bloodhound.NodeKinds.DatabaseRole,
-						TargetName:    db.Name,
-						TargetType:    bloodhound.NodeKinds.Database,
-						SQLServerName: serverInfo.SQLServerName,
-						DatabaseName:  db.Name,
-						IsFixedRole:   true,
+						SourceName:            principal.Name,
+						SourceType:            bloodhound.NodeKinds.DatabaseRole,
+						TargetName:            db.Name,
+						TargetType:            bloodhound.NodeKinds.Database,
+						TargetTypeDescription: "DATABASE",
+						SQLServerName:         serverInfo.SQLServerName,
+						SQLServerID:           serverInfo.ObjectIdentifier,
+						DatabaseName:          db.Name,
+						IsFixedRole:           true,
 					},
 				)
 				if err := writer.WriteEdge(edge); err != nil {
@@ -4218,6 +4327,7 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 						TargetName:    db.Name,
 						TargetType:    bloodhound.NodeKinds.Database,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						DatabaseName:  db.Name,
 						IsFixedRole:   true,
 					},
@@ -4237,6 +4347,7 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 						TargetName:    db.Name,
 						TargetType:    bloodhound.NodeKinds.Database,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						DatabaseName:  db.Name,
 						IsFixedRole:   true,
 					},
@@ -4256,6 +4367,7 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 						TargetName:    db.Name,
 						TargetType:    bloodhound.NodeKinds.Database,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						DatabaseName:  db.Name,
 						IsFixedRole:   true,
 					},
@@ -4275,13 +4387,15 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 							targetRole.ObjectIdentifier,
 							bloodhound.EdgeKinds.AddMember,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    bloodhound.NodeKinds.DatabaseRole,
-								TargetName:    targetRole.Name,
-								TargetType:    bloodhound.NodeKinds.DatabaseRole,
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								IsFixedRole:   true,
+								SourceName:            principal.Name,
+								SourceType:            bloodhound.NodeKinds.DatabaseRole,
+								TargetName:            targetRole.Name,
+								TargetType:            bloodhound.NodeKinds.DatabaseRole,
+								TargetTypeDescription: targetRole.TypeDescription,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								IsFixedRole:           true,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -4298,13 +4412,15 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 							appRole.ObjectIdentifier,
 							bloodhound.EdgeKinds.ChangePassword,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    bloodhound.NodeKinds.DatabaseRole,
-								TargetName:    appRole.Name,
-								TargetType:    bloodhound.NodeKinds.ApplicationRole,
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								IsFixedRole:   true,
+								SourceName:            principal.Name,
+								SourceType:            bloodhound.NodeKinds.DatabaseRole,
+								TargetName:            appRole.Name,
+								TargetType:            bloodhound.NodeKinds.ApplicationRole,
+								TargetTypeDescription: appRole.TypeDescription,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								IsFixedRole:           true,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -4349,6 +4465,7 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						TargetName:    serverInfo.ServerName,
 						TargetType:    bloodhound.NodeKinds.Server,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						Permission:    perm.Permission,
 					},
 				)
@@ -4370,6 +4487,7 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 							TargetName:    serverInfo.ServerName,
 							TargetType:    bloodhound.NodeKinds.Server,
 							SQLServerName: serverInfo.SQLServerName,
+							SQLServerID:   serverInfo.ObjectIdentifier,
 							Permission:    perm.Permission,
 						},
 					)
@@ -4390,6 +4508,7 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						TargetName:    serverInfo.ServerName,
 						TargetType:    bloodhound.NodeKinds.Server,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						Permission:    perm.Permission,
 					},
 				)
@@ -4403,10 +4522,12 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 					targetPrincipal := principalMap[perm.TargetPrincipalID]
 					targetName := perm.TargetName
 					targetType := bloodhound.NodeKinds.Login
+					targetTypeDesc := ""
 					isServerRole := false
 					isLogin := false
 					if targetPrincipal != nil {
 						targetName = targetPrincipal.Name
+						targetTypeDesc = targetPrincipal.TypeDescription
 						if targetPrincipal.TypeDescription == "SERVER_ROLE" {
 							targetType = bloodhound.NodeKinds.ServerRole
 							isServerRole = true
@@ -4422,12 +4543,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.Control,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    targetType,
-							SQLServerName: serverInfo.SQLServerName,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            targetType,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4441,12 +4564,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 							perm.TargetObjectIdentifier,
 							bloodhound.EdgeKinds.ExecuteAs,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-								TargetName:    targetName,
-								TargetType:    targetType,
-								SQLServerName: serverInfo.SQLServerName,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+								TargetName:            targetName,
+								TargetType:            targetType,
+								TargetTypeDescription: targetTypeDesc,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -4478,12 +4603,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 								perm.TargetObjectIdentifier,
 								bloodhound.EdgeKinds.AddMember,
 								&bloodhound.EdgeContext{
-									SourceName:    principal.Name,
-									SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-									TargetName:    targetName,
-									TargetType:    targetType,
-									SQLServerName: serverInfo.SQLServerName,
-									Permission:    perm.Permission,
+									SourceName:            principal.Name,
+									SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+									TargetName:            targetName,
+									TargetType:            targetType,
+									TargetTypeDescription: targetTypeDesc,
+									SQLServerName:         serverInfo.SQLServerName,
+									SQLServerID:           serverInfo.ObjectIdentifier,
+									Permission:            perm.Permission,
 								},
 							)
 							if err := writer.WriteEdge(edge); err != nil {
@@ -4496,12 +4623,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 							perm.TargetObjectIdentifier,
 							bloodhound.EdgeKinds.ChangeOwner,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-								TargetName:    targetName,
-								TargetType:    targetType,
-								SQLServerName: serverInfo.SQLServerName,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+								TargetName:            targetName,
+								TargetType:            targetType,
+								TargetTypeDescription: targetTypeDesc,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -4516,9 +4645,11 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 					targetPrincipal := principalMap[perm.TargetPrincipalID]
 					targetName := perm.TargetName
 					targetType := bloodhound.NodeKinds.Login
+					targetTypeDesc := ""
 					isServerRole := false
 					if targetPrincipal != nil {
 						targetName = targetPrincipal.Name
+						targetTypeDesc = targetPrincipal.TypeDescription
 						if targetPrincipal.TypeDescription == "SERVER_ROLE" {
 							targetType = bloodhound.NodeKinds.ServerRole
 							isServerRole = true
@@ -4531,12 +4662,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.Alter,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    targetType,
-							SQLServerName: serverInfo.SQLServerName,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            targetType,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4565,12 +4698,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 								perm.TargetObjectIdentifier,
 								bloodhound.EdgeKinds.AddMember,
 								&bloodhound.EdgeContext{
-									SourceName:    principal.Name,
-									SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-									TargetName:    targetName,
-									TargetType:    targetType,
-									SQLServerName: serverInfo.SQLServerName,
-									Permission:    perm.Permission,
+									SourceName:            principal.Name,
+									SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+									TargetName:            targetName,
+									TargetType:            targetType,
+									TargetTypeDescription: targetTypeDesc,
+									SQLServerName:         serverInfo.SQLServerName,
+									SQLServerID:           serverInfo.ObjectIdentifier,
+									Permission:            perm.Permission,
 								},
 							)
 							if err := writer.WriteEdge(addMemberEdge); err != nil {
@@ -4586,8 +4721,10 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 					targetPrincipal := principalMap[perm.TargetPrincipalID]
 					targetName := perm.TargetName
 					targetType := bloodhound.NodeKinds.Login
+					targetTypeDesc := ""
 					if targetPrincipal != nil {
 						targetName = targetPrincipal.Name
+						targetTypeDesc = targetPrincipal.TypeDescription
 						if targetPrincipal.TypeDescription == "SERVER_ROLE" {
 							targetType = bloodhound.NodeKinds.ServerRole
 						}
@@ -4598,12 +4735,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.TakeOwnership,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    targetType,
-							SQLServerName: serverInfo.SQLServerName,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            targetType,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4617,12 +4756,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 							perm.TargetObjectIdentifier,
 							bloodhound.EdgeKinds.ChangeOwner,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-								TargetName:    targetName,
-								TargetType:    bloodhound.NodeKinds.ServerRole,
-								SQLServerName: serverInfo.SQLServerName,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+								TargetName:            targetName,
+								TargetType:            bloodhound.NodeKinds.ServerRole,
+								TargetTypeDescription: targetTypeDesc,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(changeOwnerEdge); err != nil {
@@ -4635,8 +4776,10 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 				if perm.ClassDesc == "SERVER_PRINCIPAL" && perm.TargetObjectIdentifier != "" {
 					targetPrincipal := principalMap[perm.TargetPrincipalID]
 					targetName := perm.TargetName
+					targetTypeDesc := ""
 					if targetPrincipal != nil {
 						targetName = targetPrincipal.Name
+						targetTypeDesc = targetPrincipal.TypeDescription
 					}
 
 					// MSSQL_Impersonate edge (matches PowerShell which uses MSSQL_Impersonate at server level)
@@ -4645,12 +4788,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.Impersonate,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    bloodhound.NodeKinds.Login,
-							SQLServerName: serverInfo.SQLServerName,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            bloodhound.NodeKinds.Login,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4663,12 +4808,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.ExecuteAs,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    bloodhound.NodeKinds.Login,
-							SQLServerName: serverInfo.SQLServerName,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            bloodhound.NodeKinds.Login,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4687,6 +4834,7 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						TargetName:    serverInfo.ServerName,
 						TargetType:    bloodhound.NodeKinds.Server,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						Permission:    perm.Permission,
 					},
 				)
@@ -4705,6 +4853,7 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						TargetName:    serverInfo.ServerName,
 						TargetType:    bloodhound.NodeKinds.Server,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						Permission:    perm.Permission,
 					},
 				)
@@ -4744,12 +4893,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						targetPrincipal.ObjectIdentifier,
 						bloodhound.EdgeKinds.ChangePassword,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-							TargetName:    targetPrincipal.Name,
-							TargetType:    bloodhound.NodeKinds.Login,
-							SQLServerName: serverInfo.SQLServerName,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+							TargetName:            targetPrincipal.Name,
+							TargetType:            bloodhound.NodeKinds.Login,
+							TargetTypeDescription: targetPrincipal.TypeDescription,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4768,6 +4919,7 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 						TargetName:    serverInfo.ServerName,
 						TargetType:    bloodhound.NodeKinds.Server,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						Permission:    perm.Permission,
 					},
 				)
@@ -4802,12 +4954,14 @@ func (c *Collector) createServerPermissionEdges(writer *bloodhound.StreamingWrit
 							targetRole.ObjectIdentifier,
 							bloodhound.EdgeKinds.AddMember,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getServerPrincipalType(principal.TypeDescription),
-								TargetName:    targetRole.Name,
-								TargetType:    bloodhound.NodeKinds.ServerRole,
-								SQLServerName: serverInfo.SQLServerName,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getServerPrincipalType(principal.TypeDescription),
+								TargetName:            targetRole.Name,
+								TargetType:            bloodhound.NodeKinds.ServerRole,
+								TargetTypeDescription: targetRole.TypeDescription,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(addMemberEdge); err != nil {
@@ -4844,13 +4998,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						db.ObjectIdentifier,
 						bloodhound.EdgeKinds.Control,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    db.Name,
-							TargetType:    bloodhound.NodeKinds.Database,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            db.Name,
+							TargetType:            bloodhound.NodeKinds.Database,
+							TargetTypeDescription: "DATABASE",
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4863,13 +5019,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						db.ObjectIdentifier,
 						bloodhound.EdgeKinds.ControlDB,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    db.Name,
-							TargetType:    bloodhound.NodeKinds.Database,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            db.Name,
+							TargetType:            bloodhound.NodeKinds.Database,
+							TargetTypeDescription: "DATABASE",
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4880,11 +5038,13 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 					targetPrincipal := principalMap[perm.TargetPrincipalID]
 					targetName := perm.TargetName
 					targetType := bloodhound.NodeKinds.DatabaseUser
+					targetTypeDesc := ""
 					isRole := false
 					isUser := false
 					if targetPrincipal != nil {
 						targetName = targetPrincipal.Name
 						targetType = c.getDatabasePrincipalType(targetPrincipal.TypeDescription)
+						targetTypeDesc = targetPrincipal.TypeDescription
 						isRole = targetPrincipal.TypeDescription == "DATABASE_ROLE"
 						isUser = targetPrincipal.TypeDescription == "WINDOWS_USER" ||
 							targetPrincipal.TypeDescription == "WINDOWS_GROUP" ||
@@ -4899,13 +5059,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.Control,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    targetType,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            targetType,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -4920,13 +5082,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 							perm.TargetObjectIdentifier,
 							bloodhound.EdgeKinds.AddMember,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-								TargetName:    targetName,
-								TargetType:    targetType,
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+								TargetName:            targetName,
+								TargetType:            targetType,
+								TargetTypeDescription: targetTypeDesc,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -4938,13 +5102,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 							perm.TargetObjectIdentifier,
 							bloodhound.EdgeKinds.ChangeOwner,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-								TargetName:    targetName,
-								TargetType:    targetType,
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+								TargetName:            targetName,
+								TargetType:            targetType,
+								TargetTypeDescription: targetTypeDesc,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -4957,13 +5123,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 							perm.TargetObjectIdentifier,
 							bloodhound.EdgeKinds.ExecuteAs,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-								TargetName:    targetName,
-								TargetType:    targetType,
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+								TargetName:            targetName,
+								TargetType:            targetType,
+								TargetTypeDescription: targetTypeDesc,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -4981,13 +5149,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						db.ObjectIdentifier,
 						bloodhound.EdgeKinds.Connect,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    db.Name,
-							TargetType:    bloodhound.NodeKinds.Database,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            db.Name,
+							TargetType:            bloodhound.NodeKinds.Database,
+							TargetTypeDescription: "DATABASE",
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -5003,13 +5173,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						db.ObjectIdentifier,
 						bloodhound.EdgeKinds.Alter,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    db.Name,
-							TargetType:    bloodhound.NodeKinds.Database,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            db.Name,
+							TargetType:            bloodhound.NodeKinds.Database,
+							TargetTypeDescription: "DATABASE",
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -5042,13 +5214,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 									targetPrincipal.ObjectIdentifier,
 									bloodhound.EdgeKinds.AddMember,
 									&bloodhound.EdgeContext{
-										SourceName:    principal.Name,
-										SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-										TargetName:    targetPrincipal.Name,
-										TargetType:    bloodhound.NodeKinds.DatabaseRole,
-										SQLServerName: serverInfo.SQLServerName,
-										DatabaseName:  db.Name,
-										Permission:    perm.Permission,
+										SourceName:            principal.Name,
+										SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+										TargetName:            targetPrincipal.Name,
+										TargetType:            bloodhound.NodeKinds.DatabaseRole,
+										TargetTypeDescription: targetPrincipal.TypeDescription,
+										SQLServerName:         serverInfo.SQLServerName,
+										SQLServerID:           serverInfo.ObjectIdentifier,
+										DatabaseName:          db.Name,
+										Permission:            perm.Permission,
 									},
 								)
 								if err := writer.WriteEdge(edge); err != nil {
@@ -5062,13 +5236,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 								targetPrincipal.ObjectIdentifier,
 								bloodhound.EdgeKinds.ChangePassword,
 								&bloodhound.EdgeContext{
-									SourceName:    principal.Name,
-									SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-									TargetName:    targetPrincipal.Name,
-									TargetType:    bloodhound.NodeKinds.ApplicationRole,
-									SQLServerName: serverInfo.SQLServerName,
-									DatabaseName:  db.Name,
-									Permission:    perm.Permission,
+									SourceName:            principal.Name,
+									SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+									TargetName:            targetPrincipal.Name,
+									TargetType:            bloodhound.NodeKinds.ApplicationRole,
+									TargetTypeDescription: targetPrincipal.TypeDescription,
+									SQLServerName:         serverInfo.SQLServerName,
+									SQLServerID:           serverInfo.ObjectIdentifier,
+									DatabaseName:          db.Name,
+									Permission:            perm.Permission,
 								},
 							)
 							if err := writer.WriteEdge(edge); err != nil {
@@ -5081,10 +5257,12 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 					targetPrincipal := principalMap[perm.TargetPrincipalID]
 					targetName := perm.TargetName
 					targetType := bloodhound.NodeKinds.DatabaseUser
+					targetTypeDesc := ""
 					isRole := false
 					if targetPrincipal != nil {
 						targetName = targetPrincipal.Name
 						targetType = c.getDatabasePrincipalType(targetPrincipal.TypeDescription)
+						targetTypeDesc = targetPrincipal.TypeDescription
 						isRole = targetPrincipal.TypeDescription == "DATABASE_ROLE"
 					}
 
@@ -5094,13 +5272,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.Alter,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    targetType,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            targetType,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -5114,13 +5294,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 							perm.TargetObjectIdentifier,
 							bloodhound.EdgeKinds.AddMember,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-								TargetName:    targetName,
-								TargetType:    targetType,
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+								TargetName:            targetName,
+								TargetType:            targetType,
+								TargetTypeDescription: targetTypeDesc,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(addMemberEdge); err != nil {
@@ -5140,6 +5322,7 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						TargetName:    db.Name,
 						TargetType:    bloodhound.NodeKinds.Database,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						DatabaseName:  db.Name,
 						Permission:    perm.Permission,
 					},
@@ -5177,13 +5360,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 							targetRole.ObjectIdentifier,
 							bloodhound.EdgeKinds.AddMember,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-								TargetName:    targetRole.Name,
-								TargetType:    bloodhound.NodeKinds.DatabaseRole,
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+								TargetName:            targetRole.Name,
+								TargetType:            bloodhound.NodeKinds.DatabaseRole,
+								TargetTypeDescription: targetRole.TypeDescription,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(addMemberEdge); err != nil {
@@ -5204,6 +5389,7 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						TargetName:    db.Name,
 						TargetType:    bloodhound.NodeKinds.Database,
 						SQLServerName: serverInfo.SQLServerName,
+						SQLServerID:   serverInfo.ObjectIdentifier,
 						DatabaseName:  db.Name,
 						Permission:    perm.Permission,
 					},
@@ -5221,13 +5407,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 							appRole.ObjectIdentifier,
 							bloodhound.EdgeKinds.ChangePassword,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-								TargetName:    appRole.Name,
-								TargetType:    bloodhound.NodeKinds.ApplicationRole,
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+								TargetName:            appRole.Name,
+								TargetType:            bloodhound.NodeKinds.ApplicationRole,
+								TargetTypeDescription: appRole.TypeDescription,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -5242,8 +5430,10 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 				if perm.ClassDesc == "DATABASE_PRINCIPAL" && perm.TargetObjectIdentifier != "" {
 					targetPrincipal := principalMap[perm.TargetPrincipalID]
 					targetName := perm.TargetName
+					targetTypeDesc := ""
 					if targetPrincipal != nil {
 						targetName = targetPrincipal.Name
+						targetTypeDesc = targetPrincipal.TypeDescription
 					}
 
 					// PowerShell creates both MSSQL_Impersonate and MSSQL_ExecuteAs for database user impersonation
@@ -5252,13 +5442,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.Impersonate,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    bloodhound.NodeKinds.DatabaseUser,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            bloodhound.NodeKinds.DatabaseUser,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -5271,13 +5463,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						perm.TargetObjectIdentifier,
 						bloodhound.EdgeKinds.ExecuteAs,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    targetName,
-							TargetType:    bloodhound.NodeKinds.DatabaseUser,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            targetName,
+							TargetType:            bloodhound.NodeKinds.DatabaseUser,
+							TargetTypeDescription: targetTypeDesc,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -5295,13 +5489,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 						db.ObjectIdentifier,
 						bloodhound.EdgeKinds.TakeOwnership,
 						&bloodhound.EdgeContext{
-							SourceName:    principal.Name,
-							SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-							TargetName:    db.Name,
-							TargetType:    bloodhound.NodeKinds.Database,
-							SQLServerName: serverInfo.SQLServerName,
-							DatabaseName:  db.Name,
-							Permission:    perm.Permission,
+							SourceName:            principal.Name,
+							SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+							TargetName:            db.Name,
+							TargetType:            bloodhound.NodeKinds.Database,
+							TargetTypeDescription: "DATABASE",
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							DatabaseName:          db.Name,
+							Permission:            perm.Permission,
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
@@ -5316,13 +5512,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 								targetRole.ObjectIdentifier,
 								bloodhound.EdgeKinds.ChangeOwner,
 								&bloodhound.EdgeContext{
-									SourceName:    principal.Name,
-									SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-									TargetName:    targetRole.Name,
-									TargetType:    bloodhound.NodeKinds.DatabaseRole,
-									SQLServerName: serverInfo.SQLServerName,
-									DatabaseName:  db.Name,
-									Permission:    perm.Permission,
+									SourceName:            principal.Name,
+									SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+									TargetName:            targetRole.Name,
+									TargetType:            bloodhound.NodeKinds.DatabaseRole,
+									TargetTypeDescription: targetRole.TypeDescription,
+									SQLServerName:         serverInfo.SQLServerName,
+									SQLServerID:           serverInfo.ObjectIdentifier,
+									DatabaseName:          db.Name,
+									Permission:            perm.Permission,
 								},
 							)
 							if err := writer.WriteEdge(changeOwnerEdge); err != nil {
@@ -5348,13 +5546,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 							perm.TargetObjectIdentifier,
 							bloodhound.EdgeKinds.TakeOwnership,
 							&bloodhound.EdgeContext{
-								SourceName:    principal.Name,
-								SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-								TargetName:    targetPrincipal.Name,
-								TargetType:    c.getDatabasePrincipalType(targetPrincipal.TypeDescription),
-								SQLServerName: serverInfo.SQLServerName,
-								DatabaseName:  db.Name,
-								Permission:    perm.Permission,
+								SourceName:            principal.Name,
+								SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+								TargetName:            targetPrincipal.Name,
+								TargetType:            c.getDatabasePrincipalType(targetPrincipal.TypeDescription),
+								TargetTypeDescription: targetPrincipal.TypeDescription,
+								SQLServerName:         serverInfo.SQLServerName,
+								SQLServerID:           serverInfo.ObjectIdentifier,
+								DatabaseName:          db.Name,
+								Permission:            perm.Permission,
 							},
 						)
 						if err := writer.WriteEdge(edge); err != nil {
@@ -5368,13 +5568,15 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 								perm.TargetObjectIdentifier,
 								bloodhound.EdgeKinds.ChangeOwner,
 								&bloodhound.EdgeContext{
-									SourceName:    principal.Name,
-									SourceType:    c.getDatabasePrincipalType(principal.TypeDescription),
-									TargetName:    targetPrincipal.Name,
-									TargetType:    bloodhound.NodeKinds.DatabaseRole,
-									SQLServerName: serverInfo.SQLServerName,
-									DatabaseName:  db.Name,
-									Permission:    perm.Permission,
+									SourceName:            principal.Name,
+									SourceType:            c.getDatabasePrincipalType(principal.TypeDescription),
+									TargetName:            targetPrincipal.Name,
+									TargetType:            bloodhound.NodeKinds.DatabaseRole,
+									TargetTypeDescription: targetPrincipal.TypeDescription,
+									SQLServerName:         serverInfo.SQLServerName,
+									SQLServerID:           serverInfo.ObjectIdentifier,
+									DatabaseName:          db.Name,
+									Permission:            perm.Permission,
 								},
 							)
 							if err := writer.WriteEdge(changeOwnerEdge); err != nil {
@@ -5395,6 +5597,11 @@ func (c *Collector) createDatabasePermissionEdges(writer *bloodhound.StreamingWr
 // Returns nil if the edge is non-traversable and IncludeNontraversableEdges is false,
 // matching PowerShell's Add-Edge behavior which drops non-traversable edges entirely.
 func (c *Collector) createEdge(sourceID, targetID, kind string, ctx *bloodhound.EdgeContext) *bloodhound.Edge {
+	// Auto-set SourceID and TargetID from parameters so callers don't need to
+	if ctx != nil {
+		ctx.SourceID = sourceID
+		ctx.TargetID = targetID
+	}
 	props := bloodhound.GetEdgeProperties(kind, ctx)
 
 	// Apply MakeInterestingEdgesTraversable overrides before filtering
