@@ -25,6 +25,9 @@ type Client struct {
 	ldapPassword     string
 	dnsResolver      string // Custom DNS resolver IP
 	resolver         *net.Resolver
+	proxyDialer      interface {
+		DialContext(ctx context.Context, network, address string) (net.Conn, error)
+	}
 
 	// Caches
 	sidCache    map[string]*types.DomainPrincipal
@@ -95,10 +98,10 @@ func (c *Client) connectWithExplicitCredentials(dc, serverName string) error {
 	var errors []string
 
 	// Try LDAPS first (port 636) - most secure
-	conn, err := ldap.DialURL(fmt.Sprintf("ldaps://%s:636", dc), ldap.DialWithTLSConfig(&tls.Config{
+	conn, err := c.dialLDAP("ldaps", dc, "636", &tls.Config{
 		ServerName:         serverName,
 		InsecureSkipVerify: true,
-	}))
+	})
 	if err == nil {
 		conn.SetTimeout(30 * time.Second)
 
@@ -134,7 +137,7 @@ func (c *Client) connectWithExplicitCredentials(dc, serverName string) error {
 	}
 
 	// Try StartTLS on port 389
-	conn, err = ldap.DialURL(fmt.Sprintf("ldap://%s:389", dc))
+	conn, err = c.dialLDAP("ldap", dc, "389", nil)
 	if err == nil {
 		conn.SetTimeout(30 * time.Second)
 		tlsErr := c.startTLS(conn, dc)
@@ -169,10 +172,12 @@ func (c *Client) connectWithExplicitCredentials(dc, serverName string) error {
 			errors = append(errors, fmt.Sprintf("LDAP:389 StartTLS: %v", tlsErr))
 		}
 		conn.Close()
+	} else {
+		errors = append(errors, fmt.Sprintf("LDAP:389+StartTLS connect: %v", err))
 	}
 
 	// Try plain LDAP with NTLM (has built-in encryption via NTLM sealing)
-	conn, err = ldap.DialURL(fmt.Sprintf("ldap://%s:389", dc))
+	conn, err = c.dialLDAP("ldap", dc, "389", nil)
 	if err == nil {
 		conn.SetTimeout(30 * time.Second)
 		if bindErr := c.ntlmBind(conn); bindErr == nil {
@@ -183,6 +188,8 @@ func (c *Client) connectWithExplicitCredentials(dc, serverName string) error {
 			errors = append(errors, fmt.Sprintf("LDAP:389 NTLM: %v", bindErr))
 		}
 		conn.Close()
+	} else {
+		errors = append(errors, fmt.Sprintf("LDAP:389 connect: %v", err))
 	}
 
 	return fmt.Errorf("all LDAP authentication methods failed with explicit credentials: %s", strings.Join(errors, "; "))
@@ -193,10 +200,10 @@ func (c *Client) connectWithCurrentUser(dc, serverName string) error {
 	var errors []string
 
 	// Try LDAPS first (port 636) - most reliable with channel binding
-	conn, err := ldap.DialURL(fmt.Sprintf("ldaps://%s:636", dc), ldap.DialWithTLSConfig(&tls.Config{
+	conn, err := c.dialLDAP("ldaps", dc, "636", &tls.Config{
 		ServerName:         serverName,
 		InsecureSkipVerify: true,
-	}))
+	})
 	if err == nil {
 		conn.SetTimeout(30 * time.Second)
 		bindErr := c.gssapiBind(conn, dc)
@@ -212,7 +219,7 @@ func (c *Client) connectWithCurrentUser(dc, serverName string) error {
 	}
 
 	// Try StartTLS on port 389
-	conn, err = ldap.DialURL(fmt.Sprintf("ldap://%s:389", dc))
+	conn, err = c.dialLDAP("ldap", dc, "389", nil)
 	if err == nil {
 		conn.SetTimeout(30 * time.Second)
 		tlsErr := c.startTLS(conn, dc)
@@ -228,10 +235,12 @@ func (c *Client) connectWithCurrentUser(dc, serverName string) error {
 			errors = append(errors, fmt.Sprintf("LDAP:389 StartTLS: %v", tlsErr))
 		}
 		conn.Close()
+	} else {
+		errors = append(errors, fmt.Sprintf("LDAP:389+StartTLS connect: %v", err))
 	}
 
 	// Try plain LDAP without TLS (may work if DC doesn't require signing)
-	conn, err = ldap.DialURL(fmt.Sprintf("ldap://%s:389", dc))
+	conn, err = c.dialLDAP("ldap", dc, "389", nil)
 	if err == nil {
 		conn.SetTimeout(30 * time.Second)
 		bindErr3 := c.gssapiBind(conn, dc)
@@ -242,6 +251,8 @@ func (c *Client) connectWithCurrentUser(dc, serverName string) error {
 		}
 		errors = append(errors, fmt.Sprintf("LDAP:389 GSSAPI: %v", bindErr3))
 		conn.Close()
+	} else {
+		errors = append(errors, fmt.Sprintf("LDAP:389 connect: %v", err))
 	}
 
 	// Provide helpful troubleshooting message
@@ -372,6 +383,67 @@ func (c *Client) startTLS(conn *ldap.Conn, dc string) error {
 		ServerName:         serverName,
 		InsecureSkipVerify: true,
 	})
+}
+
+// SetProxyDialer sets a SOCKS5 proxy dialer for all LDAP connections.
+// It also rebuilds the DNS resolver to route through the proxy if a custom
+// DNS resolver is configured.
+func (c *Client) SetProxyDialer(d interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}) {
+	c.proxyDialer = d
+	// Rebuild DNS resolver to route through proxy if custom DNS resolver is set
+	if c.dnsResolver != "" && d != nil {
+		c.resolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				// Force TCP: SOCKS5 doesn't support UDP, and DNS works fine over TCP
+				return d.DialContext(ctx, "tcp", net.JoinHostPort(c.dnsResolver, "53"))
+			},
+		}
+	}
+}
+
+// dialLDAP establishes an LDAP connection, routing through the proxy if configured.
+// For "ldaps" scheme, it performs a TLS handshake after the TCP connection.
+func (c *Client) dialLDAP(scheme, host, port string, tlsConfig *tls.Config) (*ldap.Conn, error) {
+	if c.proxyDialer == nil {
+		// Use standard DialURL
+		url := fmt.Sprintf("%s://%s:%s", scheme, host, port)
+		if tlsConfig != nil {
+			return ldap.DialURL(url, ldap.DialWithTLSConfig(tlsConfig))
+		}
+		return ldap.DialURL(url)
+	}
+
+	// Dial through proxy
+	addr := net.JoinHostPort(host, port)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rawConn, err := c.proxyDialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("proxy dial to %s failed: %w", addr, err)
+	}
+
+	if scheme == "ldaps" {
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{}
+		}
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			rawConn.Close()
+			return nil, fmt.Errorf("TLS handshake through proxy failed: %w", err)
+		}
+		conn := ldap.NewConn(tlsConn, true)
+		conn.Start()
+		return conn, nil
+	}
+
+	// Plain LDAP
+	conn := ldap.NewConn(rawConn, false)
+	conn.Start()
+	return conn, nil
 }
 
 // Close closes the LDAP connection

@@ -86,6 +86,48 @@ Collect from a single SQL Server:
 
 # With explicit LDAP credentials (recommended for large domains)
 ./mssqlhound --scan-all-computers --ldap-user "DOMAIN\username" --ldap-password "password"
+
+# Specifying domain controller IP (also used as DNS resolver)
+./mssqlhound --scan-all-computers --dc-ip 10.0.0.1 --ldap-user "DOMAIN\username" --ldap-password "password"
+```
+
+### DNS and Domain Controller Configuration
+
+```bash
+# Use a specific DNS resolver for domain lookups
+./mssqlhound --scan-all-computers --dns-resolver 10.0.0.1
+
+# Specify DC IP (automatically used as DNS resolver if --dns-resolver is not set)
+./mssqlhound --scan-all-computers --dc-ip 10.0.0.1
+
+# Use separate DNS resolver and DC
+./mssqlhound --scan-all-computers --dc-ip 10.0.0.1 --dns-resolver 10.0.0.2
+```
+
+### SOCKS5 Proxy Support
+
+All network traffic (SQL connections, LDAP queries, EPA tests) can be tunneled through a SOCKS5 proxy:
+
+```bash
+# Basic SOCKS5 proxy
+./mssqlhound -s sql.contoso.com --proxy 127.0.0.1:1080
+
+# With proxy authentication
+./mssqlhound -s sql.contoso.com --proxy "socks5://user:pass@127.0.0.1:1080"
+
+# Combined with domain enumeration
+./mssqlhound --scan-all-computers --proxy 127.0.0.1:1080 --dc-ip 10.0.0.1
+```
+
+**Note:** SQL Browser (UDP) resolution is not supported through SOCKS5 proxies. Named instances must include explicit ports (e.g., `sql.contoso.com\INSTANCE:1433`).
+
+### Credential Fallback
+
+When `--ldap-user` and `--ldap-password` are not specified, the tool automatically reuses SQL credentials for LDAP authentication if the `--user` value contains a domain delimiter (`\` or `@`):
+
+```bash
+# These domain credentials are used for both SQL and LDAP
+./mssqlhound --scan-all-computers -u "DOMAIN\admin" -p "password"
 ```
 
 ### Options
@@ -96,7 +138,9 @@ Collect from a single SQL Server:
 | `-u, --user` | SQL login username |
 | `-p, --password` | SQL login password |
 | `-d, --domain` | Domain for name/SID resolution |
-| `--dc` | Domain controller to use |
+| `--dc-ip` | Domain controller IP address (used as DNS resolver if `--dns-resolver` not specified) |
+| `--dns-resolver` | DNS resolver IP address for domain lookups |
+| `--proxy` | SOCKS5 proxy address for tunneling all traffic (`host:port` or `socks5://[user:pass@]host:port`) |
 | `-w, --workers` | Number of concurrent workers (default: 10) |
 | `-o, --output-directory` | Output directory for zip file |
 | `--scan-all-computers` | Scan all domain computers, not just those with SPNs |

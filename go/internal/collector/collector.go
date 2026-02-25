@@ -20,6 +20,7 @@ import (
 	"github.com/SpecterOps/MSSQLHound/internal/ad"
 	"github.com/SpecterOps/MSSQLHound/internal/bloodhound"
 	"github.com/SpecterOps/MSSQLHound/internal/mssql"
+	"github.com/SpecterOps/MSSQLHound/internal/proxydialer"
 	"github.com/SpecterOps/MSSQLHound/internal/types"
 	"github.com/SpecterOps/MSSQLHound/internal/wmi"
 )
@@ -32,9 +33,8 @@ type Config struct {
 	ServerList       string
 	UserID           string
 	Password         string
-	Domain           string
-	DomainController string
-	DCIP             string // Domain controller IP address
+	Domain string
+	DCIP   string // Domain controller hostname or IP address
 	DNSResolver      string // DNS resolver to use for lookups
 	LDAPUser         string
 	LDAPPassword     string
@@ -63,11 +63,15 @@ type Config struct {
 
 	// Concurrency
 	Workers int // Number of concurrent workers (0 = sequential)
+
+	// Proxy
+	ProxyAddr string // SOCKS5 proxy address for tunneling all traffic
 }
 
 // Collector handles the data collection process
 type Collector struct {
 	config                     *Config
+	proxyDialer                proxydialer.ContextDialer
 	tempDir                    string
 	outputFiles                []string
 	outputFilesMu              sync.Mutex // Protects outputFiles
@@ -120,8 +124,35 @@ func (c *Collector) getDNSResolver() string {
 	return ""
 }
 
+// newADClient creates a new AD client with proxy settings if configured.
+func (c *Collector) newADClient(domain string) *ad.Client {
+	adClient := ad.NewClient(domain, c.config.DCIP, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+	if c.proxyDialer != nil {
+		adClient.SetProxyDialer(c.proxyDialer)
+	}
+	return adClient
+}
+
+// newMSSQLClient creates a new MSSQL client with proxy settings if configured.
+func (c *Collector) newMSSQLClient(serverInstance, userID, password string) *mssql.Client {
+	client := mssql.NewClient(serverInstance, userID, password)
+	if c.proxyDialer != nil {
+		client.SetProxyDialer(c.proxyDialer)
+	}
+	return client
+}
+
 // Run executes the collection process
 func (c *Collector) Run() error {
+	// Create proxy dialer if configured
+	if c.config.ProxyAddr != "" {
+		pd, err := proxydialer.New(c.config.ProxyAddr)
+		if err != nil {
+			return fmt.Errorf("failed to create proxy dialer: %w", err)
+		}
+		c.proxyDialer = pd
+	}
+
 	// Setup temp directory
 	if err := c.setupTempDir(); err != nil {
 		return fmt.Errorf("failed to setup temp directory: %w", err)
@@ -472,7 +503,7 @@ func (c *Collector) tryResolveSID(server *ServerToProcess) {
 	}
 
 	// Try LDAP
-	adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+	adClient := c.newADClient(c.config.Domain)
 	defer adClient.Close()
 
 	sid, err := adClient.ResolveComputerSID(server.Hostname)
@@ -530,7 +561,7 @@ func (c *Collector) detectDomain() string {
 // enumerateServersFromAD discovers MSSQL servers from Active Directory SPNs
 func (c *Collector) enumerateServersFromAD() error {
 	// First try native Go LDAP
-	adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+	adClient := c.newADClient(c.config.Domain)
 
 	spns, err := adClient.EnumerateMSSQLSPNs()
 	adClient.Close()
@@ -601,7 +632,7 @@ func (c *Collector) enumerateServersFromAD() error {
 	// If ScanAllComputers is enabled, also enumerate all domain computers
 	if c.config.ScanAllComputers {
 		fmt.Println("ScanAllComputers enabled, enumerating all domain computers...")
-		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+		adClient := c.newADClient(c.config.Domain)
 		defer adClient.Close()
 
 		computers, err := adClient.EnumerateAllComputers()
@@ -767,11 +798,22 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 	c.serverSPNDataMu.RUnlock()
 
 	// Connect to the server
-	client := mssql.NewClient(server.ConnectionString, c.config.UserID, c.config.Password)
+	client := c.newMSSQLClient(server.ConnectionString, c.config.UserID, c.config.Password)
 	client.SetDomain(c.config.Domain)
 	client.SetLDAPCredentials(c.config.LDAPUser, c.config.LDAPPassword)
 	client.SetVerbose(c.config.Verbose)
 	client.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
+
+	// Run EPA checks before attempting SQL authentication
+	if c.config.LDAPUser != "" && c.config.LDAPPassword != "" {
+		epaResult, err := client.TestEPA(ctx)
+		if err != nil {
+			c.logVerbose("EPA pre-check failed for %s: %v", server.ConnectionString, err)
+		} else {
+			client.SetEPAResult(epaResult)
+		}
+	}
+
 	if err := client.Connect(ctx); err != nil {
 		// If hostname doesn't have a domain but we have one from linked server discovery, try FQDN
 		if server.Domain != "" && !strings.Contains(server.Hostname, ".") {
@@ -786,11 +828,22 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 				fqdnConnStr = fmt.Sprintf("%s\\%s", fqdnHostname, server.InstanceName)
 			}
 
-			fqdnClient := mssql.NewClient(fqdnConnStr, c.config.UserID, c.config.Password)
+			fqdnClient := c.newMSSQLClient(fqdnConnStr, c.config.UserID, c.config.Password)
 			fqdnClient.SetDomain(c.config.Domain)
 			fqdnClient.SetLDAPCredentials(c.config.LDAPUser, c.config.LDAPPassword)
 			fqdnClient.SetVerbose(c.config.Verbose)
 			fqdnClient.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
+
+			// Run EPA checks before attempting SQL authentication on FQDN client
+			if c.config.LDAPUser != "" && c.config.LDAPPassword != "" {
+				epaResult, epaErr := fqdnClient.TestEPA(ctx)
+				if epaErr != nil {
+					c.logVerbose("EPA pre-check failed for %s: %v", fqdnConnStr, epaErr)
+				} else {
+					fqdnClient.SetEPAResult(epaResult)
+				}
+			}
+
 			fqdnErr := fqdnClient.Connect(ctx)
 			if fqdnErr == nil {
 				// FQDN connection succeeded - update server info and continue
@@ -1003,7 +1056,7 @@ func (c *Collector) lookupSPNsForServer(server *ServerToProcess) *ServerSPNInfo 
 	fmt.Printf("  Looking up SPNs for %s in AD (domain: %s)\n", server.Hostname, domain)
 
 	// Try native LDAP first
-	adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+	adClient := c.newADClient(domain)
 	spns, err := adClient.LookupMSSQLSPNsForHost(server.Hostname)
 	adClient.Close()
 
@@ -1211,7 +1264,7 @@ func (c *Collector) resolveComputerSIDViaLDAP(serverInfo *types.ServerInfo) {
 	c.logVerbose("  Method 3: LDAP query")
 
 	// Create AD client
-	adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+	adClient := c.newADClient(domain)
 	defer adClient.Close()
 
 	sid, err = adClient.ResolveComputerSID(machineName)
@@ -1416,7 +1469,7 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 
 			// For other computer accounts, try LDAP
 			if c.config.Domain != "" {
-				adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+				adClient := c.newADClient(c.config.Domain)
 				principal, err := adClient.ResolveSID(sa.SID)
 				adClient.Close()
 				if err == nil && principal != nil && principal.ObjectClass == "computer" {
@@ -1439,7 +1492,7 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 			}
 
 			// Create AD client
-			adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+			adClient := c.newADClient(c.config.Domain)
 			principal, err := adClient.ResolveName(sa.Name)
 			adClient.Close()
 			if err != nil {
@@ -1473,7 +1526,7 @@ func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo) {
 		if identity == "" {
 			return nil
 		}
-		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.config.DNSResolver)
+		adClient := c.newADClient(c.config.Domain)
 		principal, err := adClient.ResolveName(identity)
 		adClient.Close()
 		if err != nil || principal == nil || principal.SID == "" {
@@ -1594,7 +1647,7 @@ func (c *Collector) enumerateLocalGroupMembers(serverInfo *types.ServerInfo) {
 
 			// Fall back to LDAP if Windows API didn't work and we have a domain
 			if lm.SID == "" && c.config.Domain != "" {
-				adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+				adClient := c.newADClient(c.config.Domain)
 				resolved, err := adClient.ResolveName(fullName)
 				adClient.Close()
 				if err == nil && resolved.SID != "" {
@@ -2123,7 +2176,7 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 	// This provides properties like SAMAccountName, distinguishedName, DNSHostName, etc.
 	resolvedPrincipals := make(map[string]*types.DomainPrincipal)
 	if c.config.Domain != "" {
-		adClient := ad.NewClient(c.config.Domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+		adClient := c.newADClient(c.config.Domain)
 		for _, principal := range serverInfo.ServerPrincipals {
 			if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
 				continue
@@ -3976,7 +4029,7 @@ func (c *Collector) resolveDataSourceToSID(hostname, port, instanceName, domain 
 
 	// Try LDAP if domain is specified and Windows API failed
 	if domain != "" {
-		adClient := ad.NewClient(domain, c.config.DomainController, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
+		adClient := c.newADClient(domain)
 		defer adClient.Close()
 
 		sid, err = adClient.ResolveComputerSID(machineName)

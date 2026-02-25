@@ -7,7 +7,9 @@ package mssql
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/rand"
 	"net"
@@ -26,6 +28,12 @@ type EPATestConfig struct {
 	Password     string
 	TestMode     EPATestMode
 	Verbose      bool
+	DisableMIC         bool // Diagnostic: omit MsvAvFlags and MIC from Type3
+	UseRawTargetInfo   bool // Diagnostic: use server's raw target info (no EPA mods, no MIC)
+	UseClientTimestamp bool // Diagnostic: use time.Now() FILETIME instead of server's MsvAvTimestamp
+	ProxyDialer  interface {
+		DialContext(ctx context.Context, network, address string) (net.Conn, error)
+	}
 }
 
 // epaTestOutcome represents the result of a single EPA test connection attempt.
@@ -102,8 +110,22 @@ func runEPATest(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, by
 
 	// TCP connect
 	addr := fmt.Sprintf("%s:%d", config.Hostname, port)
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	var conn net.Conn
+	var err error
+	if config.ProxyDialer != nil {
+		// Resolve hostname to IP first — SOCKS proxies often can't resolve
+		// internal DNS names, but net.DefaultResolver is configured to use
+		// TCP DNS through the proxy.
+		dialAddr, resolveErr := resolveForProxy(ctx, config.Hostname, port)
+		if resolveErr != nil {
+			dialAddr = addr // fall back to hostname if resolve fails
+		}
+		logf("Dialing via proxy to %s (original: %s)", dialAddr, addr)
+		conn, err = config.ProxyDialer.DialContext(ctx, "tcp", dialAddr)
+	} else {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("TCP connect to %s failed: %w", addr, err)
 	}
@@ -141,18 +163,38 @@ func runEPATest(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, by
 	}
 	logf("TLS handshake complete, cipher: 0x%04X", tlsConn.ConnectionState().CipherSuite)
 
-	// Step 3: Compute channel binding hash from TLS certificate
-	cbtHash, err := getChannelBindingHashFromTLS(tlsConn)
+	// Log certificate details for debugging proxy/routing issues
+	if state := tlsConn.ConnectionState(); len(state.PeerCertificates) > 0 {
+		cert := state.PeerCertificates[0]
+		certFingerprint := sha256.Sum256(cert.Raw)
+		logf("TLS cert subject: %s, issuer: %s, SHA256: %x", cert.Subject, cert.Issuer, certFingerprint[:8])
+	}
+
+	// Step 3: Compute channel binding hash (tls-unique for TLS 1.2, tls-server-end-point for TLS 1.3)
+	logf("TLS version: 0x%04X, TLSUnique: %x", tlsConn.ConnectionState().Version, tlsConn.ConnectionState().TLSUnique)
+	cbtHash, cbtType, err := getChannelBindingHashFromTLS(tlsConn)
 	if err != nil {
 		return nil, encryptionFlag, fmt.Errorf("compute CBT: %w", err)
 	}
-	logf("CBT hash: %x", cbtHash)
+	logf("CBT hash (%s): %x", cbtType, cbtHash)
 
 	// Step 4: Setup NTLM authenticator
 	spn := computeSPN(config.Hostname, port)
 	auth := newNTLMAuth(config.Domain, config.Username, config.Password, spn)
 	auth.SetEPATestMode(config.TestMode)
 	auth.SetChannelBindingHash(cbtHash)
+	if config.DisableMIC {
+		auth.SetDisableMIC(true)
+		logf("MIC DISABLED (diagnostic bypass)")
+	}
+	if config.UseRawTargetInfo {
+		auth.SetUseRawTargetInfo(true)
+		logf("RAW TARGET INFO MODE (no EPA modifications, no MIC)")
+	}
+	if config.UseClientTimestamp {
+		auth.SetUseClientTimestamp(true)
+		logf("CLIENT TIMESTAMP MODE (using time.Now() FILETIME)")
+	}
 	logf("SPN: %s, Domain: %s, User: %s", spn, config.Domain, config.Username)
 
 	// Generate NTLM Type1 (Negotiate)
@@ -212,12 +254,38 @@ func runEPATest(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, by
 		return nil, encryptionFlag, fmt.Errorf("process NTLM challenge: %w", err)
 	}
 	logf("Server NetBIOS domain from Type2: %q (user-provided: %q)", auth.serverDomain, config.Domain)
+	logf("Server challenge: %x", auth.serverChallenge[:])
+	logf("Server negotiate flags: 0x%08X", auth.negotiateFlags)
+	if auth.timestamp != nil {
+		logf("Server timestamp: %x", auth.timestamp)
+	}
+	logf("Auth domain for NTLMv2 hash: %q", auth.GetAuthDomain())
+	logf("NTLMv2 hash: %s", auth.ComputeNTLMv2HashHex())
+
+	// Dump all AV_PAIRs from Type2 for debugging
+	for _, pair := range auth.GetTargetInfoPairs() {
+		if pair.ID == avIDMsvAvEOL {
+			logf("  AV_PAIR: %s", AVPairName(pair.ID))
+		} else if pair.ID == avIDMsvAvTimestamp {
+			logf("  AV_PAIR: %s = %x", AVPairName(pair.ID), pair.Value)
+		} else if pair.ID == avIDMsvAvFlags {
+			logf("  AV_PAIR: %s = 0x%08x", AVPairName(pair.ID), pair.Value)
+		} else if pair.ID == avIDMsvAvNbComputerName || pair.ID == avIDMsvAvNbDomainName ||
+			pair.ID == avIDMsvAvDNSComputerName || pair.ID == avIDMsvAvDNSDomainName ||
+			pair.ID == avIDMsvAvDNSTreeName || pair.ID == avIDMsvAvTargetName {
+			logf("  AV_PAIR: %s = %q", AVPairName(pair.ID), decodeUTF16LE(pair.Value))
+		} else {
+			logf("  AV_PAIR: %s (%d bytes)", AVPairName(pair.ID), len(pair.Value))
+		}
+	}
 
 	authenticateMsg, err := auth.CreateAuthenticateMessage()
 	if err != nil {
 		return nil, encryptionFlag, fmt.Errorf("create NTLM authenticate: %w", err)
 	}
-	logf("Type3 authenticate message: %d bytes (mode=%s)", len(authenticateMsg), testModeNames[config.TestMode])
+	logf("Type3 authenticate message: %d bytes (mode=%s, disableMIC=%v)", len(authenticateMsg), testModeNames[config.TestMode], config.DisableMIC)
+	logf("Type1 hex: %s", hex.EncodeToString(auth.negotiateMsg))
+	logf("Type3 hex (first 128 bytes): %s", hex.EncodeToString(authenticateMsg[:min(128, len(authenticateMsg))]))
 
 	// Step 9: Send Type3 as TDS_SSPI
 	sspiTDS := buildTDSPacketRaw(tdsPacketSSPI, authenticateMsg)
@@ -593,7 +661,7 @@ func parseErrorToken(data []byte) string {
 // (like HTTPS), so PRELOGIN and all subsequent packets are sent through TLS.
 // This is used when the server has "Enforce Strict Encryption" enabled and rejects
 // cleartext PRELOGIN packets.
-func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, error) {
+func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, byte, error) {
 	logf := func(format string, args ...interface{}) {
 		if config.Verbose {
 			fmt.Printf("    [EPA-debug] "+format+"\n", args...)
@@ -617,10 +685,21 @@ func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutco
 
 	// TCP connect
 	addr := fmt.Sprintf("%s:%d", config.Hostname, port)
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	var conn net.Conn
+	var err error
+	if config.ProxyDialer != nil {
+		dialAddr, resolveErr := resolveForProxy(ctx, config.Hostname, port)
+		if resolveErr != nil {
+			dialAddr = addr
+		}
+		logf("Dialing via proxy to %s (original: %s)", dialAddr, addr)
+		conn, err = config.ProxyDialer.DialContext(ctx, "tcp", dialAddr)
+	} else {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("TCP connect to %s failed: %w", addr, err)
+		return nil, 0, fmt.Errorf("TCP connect to %s failed: %w", addr, err)
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -630,27 +709,35 @@ func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutco
 	// TDS 8.0 does a standard TLS handshake on the raw socket.
 	tlsConn, err := performDirectTLSHandshake(conn, config.Hostname)
 	if err != nil {
-		return nil, fmt.Errorf("TLS handshake (strict): %w", err)
+		return nil, 0, fmt.Errorf("TLS handshake (strict): %w", err)
 	}
 	logf("TLS handshake complete (strict mode), cipher: 0x%04X", tlsConn.ConnectionState().CipherSuite)
 
-	// Step 2: Compute channel binding hash from TLS certificate
-	cbtHash, err := getChannelBindingHashFromTLS(tlsConn)
-	if err != nil {
-		return nil, fmt.Errorf("compute CBT: %w", err)
+	// Log certificate details for debugging proxy/routing issues
+	if state := tlsConn.ConnectionState(); len(state.PeerCertificates) > 0 {
+		cert := state.PeerCertificates[0]
+		certFingerprint := sha256.Sum256(cert.Raw)
+		logf("TLS cert subject: %s, issuer: %s, SHA256: %x", cert.Subject, cert.Issuer, certFingerprint[:8])
 	}
-	logf("CBT hash: %x", cbtHash)
+
+	// Step 2: Compute channel binding hash (tls-unique for TLS 1.2, tls-server-end-point for TLS 1.3)
+	logf("TLS version: 0x%04X, TLSUnique: %x", tlsConn.ConnectionState().Version, tlsConn.ConnectionState().TLSUnique)
+	cbtHash, cbtType, err := getChannelBindingHashFromTLS(tlsConn)
+	if err != nil {
+		return nil, 0, fmt.Errorf("compute CBT: %w", err)
+	}
+	logf("CBT hash (%s): %x", cbtType, cbtHash)
 
 	// Step 3: Send PRELOGIN through TLS (in strict mode, all TDS traffic is inside TLS)
 	preloginPayload := buildPreloginPacket()
 	preloginTDS := buildTDSPacketRaw(tdsPacketPrelogin, preloginPayload)
 	if _, err := tlsConn.Write(preloginTDS); err != nil {
-		return nil, fmt.Errorf("send PRELOGIN (strict): %w", err)
+		return nil, 0, fmt.Errorf("send PRELOGIN (strict): %w", err)
 	}
 
 	preloginResp, err := readTLSTDSPacket(tlsConn)
 	if err != nil {
-		return nil, fmt.Errorf("read PRELOGIN response (strict): %w", err)
+		return nil, 0, fmt.Errorf("read PRELOGIN response (strict): %w", err)
 	}
 
 	encryptionFlag, err := parsePreloginEncryption(preloginResp)
@@ -665,6 +752,18 @@ func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutco
 	auth := newNTLMAuth(config.Domain, config.Username, config.Password, spn)
 	auth.SetEPATestMode(config.TestMode)
 	auth.SetChannelBindingHash(cbtHash)
+	if config.DisableMIC {
+		auth.SetDisableMIC(true)
+		logf("MIC DISABLED (diagnostic bypass)")
+	}
+	if config.UseRawTargetInfo {
+		auth.SetUseRawTargetInfo(true)
+		logf("RAW TARGET INFO MODE (no EPA modifications, no MIC)")
+	}
+	if config.UseClientTimestamp {
+		auth.SetUseClientTimestamp(true)
+		logf("CLIENT TIMESTAMP MODE (using time.Now() FILETIME)")
+	}
 	logf("SPN: %s, Domain: %s, User: %s", spn, config.Domain, config.Username)
 
 	negotiateMsg := auth.CreateNegotiateMessage()
@@ -674,14 +773,14 @@ func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutco
 	login7 := buildLogin7Packet(config.Hostname, "MSSQLHound-EPA", config.Hostname, negotiateMsg)
 	login7TDS := buildTDSPacketRaw(tdsPacketLogin7, login7)
 	if _, err := tlsConn.Write(login7TDS); err != nil {
-		return nil, fmt.Errorf("send LOGIN7 (strict): %w", err)
+		return nil, 0, fmt.Errorf("send LOGIN7 (strict): %w", err)
 	}
 	logf("Sent LOGIN7 (%d bytes with TDS header) (strict)", len(login7TDS))
 
 	// Step 6: Read server response (NTLM Type2 challenge) - always through TLS
 	responseData, err := readTLSTDSPacket(tlsConn)
 	if err != nil {
-		return nil, fmt.Errorf("read challenge response (strict): %w", err)
+		return nil, 0, fmt.Errorf("read challenge response (strict): %w", err)
 	}
 	logf("Received challenge response: %d bytes", len(responseData))
 
@@ -695,33 +794,59 @@ func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutco
 			ErrorMessage:      errMsg,
 			IsUntrustedDomain: strings.Contains(errMsg, "untrusted domain"),
 			IsLoginFailed:     strings.Contains(errMsg, "Login failed"),
-		}, nil
+		}, encryptionFlag, nil
 	}
 	logf("Extracted NTLM Type2 challenge: %d bytes", len(challengeData))
 
 	// Step 7: Process challenge and generate Type3
 	if err := auth.ProcessChallenge(challengeData); err != nil {
-		return nil, fmt.Errorf("process NTLM challenge: %w", err)
+		return nil, 0, fmt.Errorf("process NTLM challenge: %w", err)
 	}
 	logf("Server NetBIOS domain from Type2: %q (user-provided: %q)", auth.serverDomain, config.Domain)
+	logf("Server challenge: %x", auth.serverChallenge[:])
+	logf("Server negotiate flags: 0x%08X", auth.negotiateFlags)
+	if auth.timestamp != nil {
+		logf("Server timestamp: %x", auth.timestamp)
+	}
+	logf("Auth domain for NTLMv2 hash: %q", auth.GetAuthDomain())
+	logf("NTLMv2 hash: %s", auth.ComputeNTLMv2HashHex())
+
+	// Dump all AV_PAIRs from Type2 for debugging
+	for _, pair := range auth.GetTargetInfoPairs() {
+		if pair.ID == avIDMsvAvEOL {
+			logf("  AV_PAIR: %s", AVPairName(pair.ID))
+		} else if pair.ID == avIDMsvAvTimestamp {
+			logf("  AV_PAIR: %s = %x", AVPairName(pair.ID), pair.Value)
+		} else if pair.ID == avIDMsvAvFlags {
+			logf("  AV_PAIR: %s = 0x%08x", AVPairName(pair.ID), pair.Value)
+		} else if pair.ID == avIDMsvAvNbComputerName || pair.ID == avIDMsvAvNbDomainName ||
+			pair.ID == avIDMsvAvDNSComputerName || pair.ID == avIDMsvAvDNSDomainName ||
+			pair.ID == avIDMsvAvDNSTreeName || pair.ID == avIDMsvAvTargetName {
+			logf("  AV_PAIR: %s = %q", AVPairName(pair.ID), decodeUTF16LE(pair.Value))
+		} else {
+			logf("  AV_PAIR: %s (%d bytes)", AVPairName(pair.ID), len(pair.Value))
+		}
+	}
 
 	authenticateMsg, err := auth.CreateAuthenticateMessage()
 	if err != nil {
-		return nil, fmt.Errorf("create NTLM authenticate: %w", err)
+		return nil, 0, fmt.Errorf("create NTLM authenticate: %w", err)
 	}
-	logf("Type3 authenticate message: %d bytes (mode=%s)", len(authenticateMsg), testModeNames[config.TestMode])
+	logf("Type3 authenticate message: %d bytes (mode=%s, disableMIC=%v)", len(authenticateMsg), testModeNames[config.TestMode], config.DisableMIC)
+	logf("Type1 hex: %s", hex.EncodeToString(auth.negotiateMsg))
+	logf("Type3 hex (first 128 bytes): %s", hex.EncodeToString(authenticateMsg[:min(128, len(authenticateMsg))]))
 
 	// Step 8: Send Type3 as TDS_SSPI through TLS
 	sspiTDS := buildTDSPacketRaw(tdsPacketSSPI, authenticateMsg)
 	if _, err := tlsConn.Write(sspiTDS); err != nil {
-		return nil, fmt.Errorf("send SSPI auth (strict): %w", err)
+		return nil, 0, fmt.Errorf("send SSPI auth (strict): %w", err)
 	}
 	logf("Sent Type3 SSPI (%d bytes with TDS header) (strict)", len(sspiTDS))
 
 	// Step 9: Read final response through TLS
 	responseData, err = readTLSTDSPacket(tlsConn)
 	if err != nil {
-		return nil, fmt.Errorf("read auth response (strict): %w", err)
+		return nil, 0, fmt.Errorf("read auth response (strict): %w", err)
 	}
 	logf("Received auth response: %d bytes", len(responseData))
 
@@ -733,7 +858,7 @@ func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutco
 		ErrorMessage:      errMsg,
 		IsUntrustedDomain: strings.Contains(errMsg, "untrusted domain"),
 		IsLoginFailed:     strings.Contains(errMsg, "Login failed"),
-	}, nil
+	}, encryptionFlag, nil
 }
 
 // readTLSTDSPacket reads a complete TDS packet through TLS.
@@ -808,4 +933,18 @@ func readTLSTDSPacket(tlsConn net.Conn) ([]byte, error) {
 	}
 
 	return payload, nil
+}
+
+// resolveForProxy resolves a hostname to an IP address for use with SOCKS proxies.
+// SOCKS proxies often cannot resolve internal DNS names, but net.DefaultResolver
+// is configured to route DNS queries through the proxy via TCP.
+func resolveForProxy(ctx context.Context, hostname string, port int) (string, error) {
+	if net.ParseIP(hostname) != nil {
+		return fmt.Sprintf("%s:%d", hostname, port), nil
+	}
+	addrs, err := net.DefaultResolver.LookupHost(ctx, hostname)
+	if err != nil || len(addrs) == 0 {
+		return "", fmt.Errorf("failed to resolve %s: %w", hostname, err)
+	}
+	return fmt.Sprintf("%s:%d", addrs[0], port), nil
 }

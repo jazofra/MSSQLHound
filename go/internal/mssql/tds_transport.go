@@ -178,6 +178,10 @@ func performTLSHandshake(tds *tdsConn, serverName string) (*tls.Conn, *switchabl
 		InsecureSkipVerify: true, //nolint:gosec // EPA testing requires connecting to any server
 		// Disable dynamic record sizing for TDS compatibility
 		DynamicRecordSizingDisabled: true,
+		// Cap at TLS 1.2 so that TLSUnique (tls-unique channel binding) is
+		// available for EPA. TLS 1.3 removed tls-unique (RFC 8446) and SQL
+		// Server's SChannel does not accept tls-server-end-point for EPA.
+		MaxVersion: tls.VersionTLS12,
 	}
 
 	tlsConn := tls.Client(sw, tlsConfig)
@@ -203,6 +207,10 @@ func performDirectTLSHandshake(conn net.Conn, serverName string) (*tls.Conn, err
 		InsecureSkipVerify: true, //nolint:gosec // EPA testing requires connecting to any server
 		// Disable dynamic record sizing for TDS compatibility
 		DynamicRecordSizingDisabled: true,
+		// Cap at TLS 1.2 so that TLSUnique (tls-unique channel binding) is
+		// available for EPA. TLS 1.3 removed tls-unique (RFC 8446) and SQL
+		// Server's SChannel does not accept tls-server-end-point for EPA.
+		MaxVersion: tls.VersionTLS12,
 	}
 
 	tlsConn := tls.Client(conn, tlsConfig)

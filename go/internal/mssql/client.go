@@ -3,6 +3,7 @@ package mssql
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
@@ -15,8 +16,231 @@ import (
 
 	"github.com/SpecterOps/MSSQLHound/internal/types"
 	mssqldb "github.com/microsoft/go-mssqldb"
+	"github.com/microsoft/go-mssqldb/integratedauth"
 	"github.com/microsoft/go-mssqldb/msdsn"
 )
+
+// epaTLSDialer wraps a TCP connection in TLS before returning it to go-mssqldb.
+// This allows us to capture TLSUnique (tls-unique channel binding) from the
+// completed TLS handshake, which isn't available from go-mssqldb's VerifyConnection
+// callback (called before Finished messages are exchanged).
+//
+// go-mssqldb uses encrypt=disable so it doesn't do additional TLS on top.
+// All data transparently flows through our outer TLS layer, which is correct
+// for TDS 8.0 strict encryption (TLS wraps the entire TDS session).
+type epaTLSDialer struct {
+	underlying  interface {
+		DialContext(ctx context.Context, network, address string) (net.Conn, error)
+	}
+	epaProvider *epaAuthProvider
+	hostname    string
+	logf        func(string, ...interface{})
+}
+
+func (d *epaTLSDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	// Establish TCP connection
+	var conn net.Conn
+	var err error
+	if d.underlying != nil {
+		conn, err = d.underlying.DialContext(ctx, network, addr)
+	} else {
+		var dialer net.Dialer
+		conn, err = dialer.DialContext(ctx, network, addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Perform TLS handshake with TDS 8.0 ALPN and TLS 1.2 cap
+	tlsConfig := &tls.Config{
+		ServerName:                  d.hostname,
+		InsecureSkipVerify:          true, //nolint:gosec // security tool needs to connect to any server
+		DynamicRecordSizingDisabled: true,
+		MaxVersion:                  tls.VersionTLS12,
+		NextProtos:                  []string{"tds/8.0"},
+	}
+
+	tlsConn := tls.Client(conn, tlsConfig)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("EPA TLS handshake: %w", err)
+	}
+
+	// Capture TLSUnique after handshake is fully complete
+	state := tlsConn.ConnectionState()
+	if len(state.TLSUnique) > 0 {
+		cbt := computeCBTHash("tls-unique:", state.TLSUnique)
+		d.epaProvider.SetCBT(cbt)
+		if d.logf != nil {
+			d.logf("  [EPA-TLS] Dialer: TLS 0x%04X, TLSUnique=%x, CBT=%x", state.Version, state.TLSUnique, cbt)
+		}
+	} else if d.logf != nil {
+		d.logf("  [EPA-TLS] WARNING: TLSUnique empty after handshake (TLS 0x%04X)", state.Version)
+	}
+
+	return tlsConn, nil
+}
+
+// epaTDSDialer performs the full TDS PRELOGIN + TLS-in-TDS handshake before
+// returning the connection to go-mssqldb. This allows us to capture TLSUnique
+// after the TLS handshake fully completes (including Finished messages), which
+// is not available from go-mssqldb's VerifyConnection callback.
+//
+// go-mssqldb is configured with encrypt=disable so it won't attempt its own TLS.
+// A preloginFakerConn wrapper intercepts go-mssqldb's PRELOGIN exchange (since
+// we already performed it) and returns a fake response indicating no encryption,
+// then transparently passes all subsequent traffic through the TLS connection.
+type epaTDSDialer struct {
+	underlying interface {
+		DialContext(ctx context.Context, network, address string) (net.Conn, error)
+	}
+	epaProvider *epaAuthProvider
+	hostname    string
+	logf        func(string, ...interface{})
+}
+
+func (d *epaTDSDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	// TCP connect
+	var conn net.Conn
+	var err error
+	if d.underlying != nil {
+		conn, err = d.underlying.DialContext(ctx, network, addr)
+	} else {
+		var dialer net.Dialer
+		conn, err = dialer.DialContext(ctx, network, addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+	tds := newTDSConn(conn)
+
+	// PRELOGIN exchange
+	preloginPayload := buildPreloginPacket()
+	if err := tds.sendPacket(tdsPacketPrelogin, preloginPayload); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("EPA TDS dialer: send PRELOGIN: %w", err)
+	}
+
+	_, preloginResp, err := tds.readFullPacket()
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("EPA TDS dialer: read PRELOGIN response: %w", err)
+	}
+
+	encryptionFlag, err := parsePreloginEncryption(preloginResp)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("EPA TDS dialer: parse encryption: %w", err)
+	}
+
+	if encryptionFlag == encryptNotSup {
+		conn.Close()
+		return nil, fmt.Errorf("EPA TDS dialer: server does not support encryption, cannot do EPA")
+	}
+
+	// TLS-in-TDS handshake (TLS records wrapped inside TDS PRELOGIN packets)
+	tlsConn, _, err := performTLSHandshake(tds, d.hostname)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("EPA TDS dialer: TLS handshake: %w", err)
+	}
+
+	// Clear deadline for go-mssqldb operations
+	conn.SetDeadline(time.Time{})
+
+	// Capture TLSUnique after handshake is fully complete (including Finished)
+	state := tlsConn.ConnectionState()
+	if len(state.TLSUnique) > 0 {
+		cbt := computeCBTHash("tls-unique:", state.TLSUnique)
+		d.epaProvider.SetCBT(cbt)
+		if d.logf != nil {
+			d.logf("  [EPA-TDS] Dialer: TLS 0x%04X, TLSUnique=%x, CBT=%x", state.Version, state.TLSUnique, cbt)
+		}
+	} else if d.logf != nil {
+		d.logf("  [EPA-TDS] WARNING: TLSUnique empty after TDS TLS handshake (TLS 0x%04X)", state.Version)
+	}
+
+	// Return wrapper that intercepts go-mssqldb's PRELOGIN and fakes the response
+	return &preloginFakerConn{
+		Conn:     tlsConn,
+		fakeResp: buildFakePreloginResponse(),
+		logf:     d.logf,
+	}, nil
+}
+
+// preloginFakerConn wraps a TLS connection and intercepts go-mssqldb's PRELOGIN
+// exchange. Since we already performed the real PRELOGIN + TLS handshake in the
+// dialer, we discard go-mssqldb's PRELOGIN write and return a fake response
+// with encryption=NOT_SUP so go-mssqldb skips its own TLS negotiation.
+// After the fake exchange, all reads/writes pass through to the TLS connection.
+type preloginFakerConn struct {
+	net.Conn
+	state      int    // 0: intercept prelogin, 1: pass through
+	fakeResp   []byte // fake PRELOGIN response TDS packet
+	fakeOffset int    // bytes consumed from fakeResp
+	logf       func(string, ...interface{})
+}
+
+func (c *preloginFakerConn) Write(b []byte) (int, error) {
+	if c.state == 0 {
+		if len(b) >= tdsHeaderSize && b[0] == tdsPacketPrelogin {
+			// Intercept PRELOGIN - don't forward to server
+			if c.logf != nil {
+				c.logf("  [EPA-TDS] Intercepted go-mssqldb PRELOGIN (%d bytes)", len(b))
+			}
+			return len(b), nil
+		}
+		// Not a PRELOGIN packet - switch to pass-through
+		c.state = 1
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *preloginFakerConn) Read(b []byte) (int, error) {
+	if c.state == 0 && c.fakeOffset < len(c.fakeResp) {
+		// Return fake PRELOGIN response
+		n := copy(b, c.fakeResp[c.fakeOffset:])
+		c.fakeOffset += n
+		if c.fakeOffset >= len(c.fakeResp) {
+			c.state = 1 // Done faking, switch to pass-through
+			if c.logf != nil {
+				c.logf("  [EPA-TDS] Delivered fake PRELOGIN response, switching to pass-through")
+			}
+		}
+		return n, nil
+	}
+	return c.Conn.Read(b)
+}
+
+// buildFakePreloginResponse constructs a minimal TDS PRELOGIN response packet
+// with encryption=NOT_SUP (0x02). This tells go-mssqldb that the server does
+// not support encryption, so it skips TLS negotiation (we already did TLS).
+func buildFakePreloginResponse() []byte {
+	// PRELOGIN option tokens: token(1) + offset(2) + length(2)
+	// Option 0x00 (Version): offset=11, length=6
+	// Option 0x01 (Encryption): offset=17, length=1
+	// Terminator: 0xFF
+	// Data: Version(6 bytes) + Encryption(1 byte)
+	payload := []byte{
+		0x00, 0x00, 0x0B, 0x00, 0x06, // Version: offset=11, len=6
+		0x01, 0x00, 0x11, 0x00, 0x01, // Encryption: offset=17, len=1
+		0xFF,                         // Terminator
+		0x0F, 0x00, 0x07, 0xD0, 0x00, 0x00, // Version data (SQL Server 2019)
+		0x02, // Encryption: NOT_SUP
+	}
+
+	// Wrap in TDS packet (type 0x04 = Tabular Result, which is the server response type)
+	pktLen := tdsHeaderSize + len(payload)
+	pkt := make([]byte, pktLen)
+	pkt[0] = tdsPacketTabularResult
+	pkt[1] = 0x01 // EOM
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(pktLen))
+	copy(pkt[tdsHeaderSize:], payload)
+
+	return pkt
+}
 
 // convertHexSIDToString converts a hex SID (like "0x0105000000...") to standard SID format (like "S-1-5-21-...")
 // This matches the PowerShell ConvertTo-SecurityIdentifier function behavior
@@ -95,6 +319,10 @@ type Client struct {
 	usePowerShell            bool              // Whether using PowerShell fallback
 	psClient                 *PowerShellClient // PowerShell client for fallback
 	collectFromLinkedServers bool              // Whether to collect from linked servers
+	epaResult                *EPATestResult    // Pre-computed EPA result (set before Connect)
+	proxyDialer              interface {
+		DialContext(ctx context.Context, network, address string) (net.Conn, error)
+	}
 }
 
 // NewClient creates a new SQL Server client
@@ -165,8 +393,10 @@ func (c *Client) Connect(ctx context.Context) error {
 		return nil
 	}
 
-	// Check if this is the "untrusted domain" error that PowerShell can handle
-	if IsUntrustedDomainError(err) && c.useWindowsAuth {
+	// Check if this is the "untrusted domain" error that PowerShell can handle.
+	// PowerShell fallback is not available when using a proxy since the spawned
+	// process cannot route its connections through the Go-level SOCKS proxy.
+	if IsUntrustedDomainError(err) && c.useWindowsAuth && c.proxyDialer == nil {
 		c.logVerbose("Native connection failed with untrusted domain error, trying PowerShell fallback...")
 		// Try PowerShell fallback
 		psErr := c.connectPowerShell(ctx)
@@ -189,10 +419,21 @@ func (c *Client) connectNative(ctx context.Context) error {
 	// even though PowerShell/System.Data.SqlClient works. This is a known limitation
 	// of the go-mssqldb driver's Windows SSPI implementation.
 
-	// Get short hostname for some strategies
-	shortHostname := c.hostname
-	if idx := strings.Index(c.hostname, "."); idx != -1 {
-		shortHostname = c.hostname[:idx]
+	// Get short hostname for some strategies (only for FQDNs, not IP addresses)
+	shortHostname := ""
+	// Determine the cert hostname for strict encryption (HostNameInCertificate).
+	// If -s is a FQDN, use it directly. If it's an IP, try reverse DNS.
+	certHost := c.hostname
+	if net.ParseIP(c.hostname) == nil {
+		if idx := strings.Index(c.hostname, "."); idx != -1 {
+			shortHostname = c.hostname[:idx]
+		}
+	} else {
+		// IP address: try reverse DNS to get FQDN for certificate matching
+		if names, err := net.LookupAddr(c.hostname); err == nil && len(names) > 0 {
+			certHost = strings.TrimSuffix(names[0], ".")
+			c.logVerbose("Resolved IP %s to FQDN %s for HostNameInCertificate", c.hostname, certHost)
+		}
 	}
 
 	type connStrategy struct {
@@ -201,48 +442,240 @@ func (c *Client) connectNative(ctx context.Context) error {
 		encrypt      string // "false", "true", or "strict"
 		useServerSPN bool
 		spnHost      string // Host to use in SPN
+		certHostname string // HostNameInCertificate for strict encryption
 	}
 
 	strategies := []connStrategy{
-		// Try FQDN with encryption (most common)
-		{"FQDN+encrypt", c.hostname, "true", false, ""},
+		// Try FQDN/IP with encryption (most common)
+		{"FQDN+encrypt", c.hostname, "true", false, "", ""},
 		// Try TDS 8.0 strict encryption (for servers enforcing strict)
-		{"FQDN+strict", c.hostname, "strict", false, ""},
+		{"FQDN+strict", c.hostname, "strict", false, "", certHost},
 		// Try with explicit SPN
-		{"FQDN+encrypt+SPN", c.hostname, "true", true, c.hostname},
+		{"FQDN+encrypt+SPN", c.hostname, "true", true, c.hostname, ""},
 		// Try without encryption
-		{"FQDN+no-encrypt", c.hostname, "false", false, ""},
-		// Try short hostname
-		{"short+encrypt", shortHostname, "true", false, ""},
-		{"short+strict", shortHostname, "strict", false, ""},
-		{"short+no-encrypt", shortHostname, "false", false, ""},
+		{"FQDN+no-encrypt", c.hostname, "false", false, "", ""},
+	}
+
+	// Only add short hostname strategies for FQDNs (not IP addresses)
+	if shortHostname != "" {
+		strategies = append(strategies,
+			connStrategy{"short+encrypt", shortHostname, "true", false, "", ""},
+			connStrategy{"short+strict", shortHostname, "strict", false, "", certHost},
+			connStrategy{"short+no-encrypt", shortHostname, "false", false, "", ""},
+		)
+	}
+
+	// Diagnostic: test go-mssqldb's built-in NTLM (without our EPA provider).
+	// This tells us if the issue is in our custom NTLM or something more fundamental.
+	// The built-in go-mssqldb ntlm package (integratedauth/ntlm) does NOT support EPA
+	// channel binding but should still handle basic NTLM auth.
+	if c.verbose && strings.Contains(c.userID, "\\") {
+		// Build a connection string that uses DOMAIN\user format to trigger go-mssqldb's
+		// built-in NTLM. Do NOT set the authenticator parameter so it uses the default
+		// ntlm provider registered via init().
+		port := c.port
+		if port == 0 {
+			port = 1433
+		}
+		diagConnStr := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;encrypt=true;TrustServerCertificate=true;app name=MSSQLHound-diag",
+			c.hostname, port, c.userID, c.password)
+		c.logVerbose("Testing go-mssqldb built-in NTLM (no EPA provider): server=%s;port=%d;user id=%s;encrypt=true",
+			c.hostname, port, c.userID)
+		diagConfig, diagParseErr := msdsn.Parse(diagConnStr)
+		if diagParseErr == nil {
+			diagConnector := mssqldb.NewConnectorConfig(diagConfig)
+			if c.proxyDialer != nil {
+				diagConnector.Dialer = c.proxyDialer
+			}
+			diagDB := sql.OpenDB(diagConnector)
+			diagCtx, diagCancel := context.WithTimeout(ctx, 10*time.Second)
+			diagErr := diagDB.PingContext(diagCtx)
+			diagCancel()
+			diagDB.Close()
+			if diagErr != nil {
+				c.logVerbose("  go-mssqldb built-in NTLM: FAILED - %v", diagErr)
+			} else {
+				c.logVerbose("  go-mssqldb built-in NTLM: SUCCESS - built-in NTLM works, issue is in our custom NTLM!")
+			}
+		}
+	}
+
+	// When EPA is Required, register a custom NTLM auth provider that includes
+	// channel binding tokens. go-mssqldb's built-in NTLM on Linux does NOT
+	// support EPA, so without this, all strategies fail with "untrusted domain".
+	var epaProvider *epaAuthProvider
+	if c.epaResult != nil && (c.epaResult.EPAStatus == "Required" || c.epaResult.EPAStatus == "Allowed") {
+		epaProvider = &epaAuthProvider{}
+		port := c.port
+		if port == 0 {
+			port = 1433
+		}
+		epaProvider.SetSPN(computeSPN(c.hostname, port))
+		integratedauth.SetIntegratedAuthenticationProvider(epaAuthProviderName, epaProvider)
+		c.logVerbose("Using EPA-aware NTLM authentication (EPA status: %s)", c.epaResult.EPAStatus)
+	}
+
+	// Special strategy for strict encryption + EPA: do TLS ourselves in the dialer
+	// so we can capture TLSUnique after the handshake completes (go-mssqldb's
+	// VerifyConnection fires before Finished messages, giving all-zero TLSUnique).
+	// go-mssqldb uses encrypt=disable so it doesn't add another TLS layer.
+	if epaProvider != nil && c.epaResult != nil && c.epaResult.StrictEncryption {
+		port := c.port
+		if port == 0 {
+			port = 1433
+		}
+		dialer := &epaTLSDialer{
+			underlying:  c.proxyDialer,
+			epaProvider: epaProvider,
+			hostname:    c.hostname,
+			logf:        c.logVerbose,
+		}
+		connStr := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;encrypt=disable;TrustServerCertificate=true;app name=MSSQLHound",
+			c.hostname, port, c.userID, c.password)
+		c.logVerbose("Trying connection strategy 'EPA+strict-TLS': %s",
+			strings.Replace(connStr, c.password, "****", 1))
+
+		config, parseErr := msdsn.Parse(connStr)
+		if parseErr == nil {
+			if config.Parameters == nil {
+				config.Parameters = make(map[string]string)
+			}
+			config.Parameters["authenticator"] = epaAuthProviderName
+
+			connector := mssqldb.NewConnectorConfig(config)
+			connector.Dialer = dialer
+			db := sql.OpenDB(connector)
+
+			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := db.PingContext(pingCtx)
+			cancel()
+
+			if err == nil {
+				c.logVerbose("  Strategy 'EPA+strict-TLS' succeeded!")
+				c.db = db
+				return nil
+			}
+			db.Close()
+			c.logVerbose("  Strategy 'EPA+strict-TLS' failed: %v", err)
+		}
+	}
+
+	// Strategy for non-strict encryption + EPA: perform the PRELOGIN + TLS-in-TDS
+	// handshake ourselves in the dialer so we can capture TLSUnique after the
+	// handshake fully completes. go-mssqldb's VerifyConnection callback fires
+	// before the TLS Finished messages are exchanged, giving all-zero TLSUnique.
+	// The dialer wraps the TLS connection with preloginFakerConn to intercept
+	// go-mssqldb's PRELOGIN exchange (already completed) and fake a response.
+	if epaProvider != nil && c.epaResult != nil && !c.epaResult.StrictEncryption {
+		port := c.port
+		if port == 0 {
+			port = 1433
+		}
+		dialer := &epaTDSDialer{
+			underlying:  c.proxyDialer,
+			epaProvider: epaProvider,
+			hostname:    c.hostname,
+			logf:        c.logVerbose,
+		}
+		connStr := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;encrypt=disable;TrustServerCertificate=true;app name=MSSQLHound",
+			c.hostname, port, c.userID, c.password)
+		c.logVerbose("Trying connection strategy 'EPA+TDS-TLS': %s",
+			strings.Replace(connStr, c.password, "****", 1))
+
+		config, parseErr := msdsn.Parse(connStr)
+		if parseErr == nil {
+			if config.Parameters == nil {
+				config.Parameters = make(map[string]string)
+			}
+			config.Parameters["authenticator"] = epaAuthProviderName
+
+			connector := mssqldb.NewConnectorConfig(config)
+			connector.Dialer = dialer
+			db := sql.OpenDB(connector)
+
+			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := db.PingContext(pingCtx)
+			cancel()
+
+			if err == nil {
+				c.logVerbose("  Strategy 'EPA+TDS-TLS' succeeded!")
+				c.db = db
+				return nil
+			}
+			db.Close()
+			c.logVerbose("  Strategy 'EPA+TDS-TLS' failed: %v", err)
+		}
 	}
 
 	var lastErr error
 	for _, strategy := range strategies {
-		connStr := c.buildConnectionStringForStrategy(strategy.serverName, strategy.encrypt, strategy.useServerSPN, strategy.spnHost)
+		connStr := c.buildConnectionStringForStrategy(strategy.serverName, strategy.encrypt, strategy.useServerSPN, strategy.spnHost, strategy.certHostname)
 		c.logVerbose("Trying connection strategy '%s': %s", strategy.name, connStr)
 
-		var db *sql.DB
-		var err error
-
-		if strategy.encrypt == "strict" {
-			// For strict encryption (TDS 8.0), go-mssqldb forces certificate
-			// validation regardless of TrustServerCertificate. Use NewConnectorConfig
-			// to override TLS settings so we can connect to servers with self-signed certs.
-			db, err = openStrictDB(connStr)
-		} else {
-			db, err = sql.Open("sqlserver", connStr)
-		}
-		if err != nil {
-			lastErr = err
-			c.logVerbose("  Strategy '%s' failed to open: %v", strategy.name, err)
+		// Parse connection string into config and use NewConnectorConfig for all
+		// strategies so we can inject a custom proxy dialer when configured.
+		config, parseErr := msdsn.Parse(connStr)
+		if parseErr != nil {
+			lastErr = parseErr
+			c.logVerbose("  Strategy '%s' failed to parse: %v", strategy.name, parseErr)
 			continue
 		}
 
+		if strategy.encrypt == "strict" {
+			// For strict encryption (TDS 8.0), go-mssqldb forces certificate
+			// validation regardless of TrustServerCertificate. Override TLS
+			// settings so we can connect to servers with self-signed certs.
+			if config.TLSConfig != nil {
+				config.TLSConfig.InsecureSkipVerify = true //nolint:gosec // security tool needs to connect to any server
+			}
+		}
+
+		// When EPA auth is needed, inject our custom authenticator and add a
+		// VerifyConnection callback to capture the TLS-unique channel binding
+		// value after go-mssqldb's TLS handshake completes.
+		if epaProvider != nil {
+			if config.Parameters == nil {
+				config.Parameters = make(map[string]string)
+			}
+			config.Parameters["authenticator"] = epaAuthProviderName
+
+			// Ensure TLSConfig exists so we can add the connection callback.
+			// For encrypt=false strategies, msdsn.Parse returns nil TLSConfig,
+			// but the server may still force TLS.
+			if config.TLSConfig == nil {
+				config.TLSConfig = &tls.Config{
+					ServerName:                  config.Host,
+					InsecureSkipVerify:          true, //nolint:gosec // security tool needs to connect to any server
+					DynamicRecordSizingDisabled: true,
+				}
+			}
+			// Cap at TLS 1.2 so that TLSUnique (tls-unique channel binding) is
+			// available for EPA. TLS 1.3 removed tls-unique (RFC 8446).
+			config.TLSConfig.MaxVersion = tls.VersionTLS12
+
+			config.TLSConfig.VerifyConnection = func(cs tls.ConnectionState) error {
+				c.logVerbose("  [EPA-TLS] VerifyConnection fired: TLS 0x%04X, TLSUnique=%x (%d bytes), certs=%d",
+					cs.Version, cs.TLSUnique, len(cs.TLSUnique), len(cs.PeerCertificates))
+				if len(cs.TLSUnique) > 0 {
+					cbt := computeCBTHash("tls-unique:", cs.TLSUnique)
+					epaProvider.SetCBT(cbt)
+					c.logVerbose("  [EPA-TLS] Set CBT (tls-unique): %x", cbt)
+				} else {
+					c.logVerbose("  [EPA-TLS] WARNING: TLSUnique empty, no CBT set!")
+				}
+				return nil
+			}
+		}
+
+		connector := mssqldb.NewConnectorConfig(config)
+		if c.proxyDialer != nil {
+			connector.Dialer = c.proxyDialer
+		}
+		db := sql.OpenDB(connector)
+
 		// Test the connection with a short timeout
 		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err = db.PingContext(pingCtx)
+		err := db.PingContext(pingCtx)
 		cancel()
 
 		if err != nil {
@@ -258,21 +691,6 @@ func (c *Client) connectNative(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("all connection strategies failed, last error: %w", lastErr)
-}
-
-// openStrictDB creates a *sql.DB for TDS 8.0 strict encryption with certificate
-// validation disabled. go-mssqldb forces TrustServerCertificate=false in strict
-// mode, so we parse the config and override InsecureSkipVerify via NewConnectorConfig.
-func openStrictDB(connStr string) (*sql.DB, error) {
-	config, err := msdsn.Parse(connStr)
-	if err != nil {
-		return nil, err
-	}
-	if config.TLSConfig != nil {
-		config.TLSConfig.InsecureSkipVerify = true //nolint:gosec // security tool needs to connect to any server
-	}
-	connector := mssqldb.NewConnectorConfig(config)
-	return sql.OpenDB(connector), nil
 }
 
 // connectPowerShell connects using PowerShell and System.Data.SqlClient
@@ -373,7 +791,7 @@ func (c *Client) DBW() *DBWrapper {
 }
 
 // buildConnectionStringForStrategy creates the connection string for a specific strategy
-func (c *Client) buildConnectionStringForStrategy(serverName, encrypt string, useServerSPN bool, spnHost string) string {
+func (c *Client) buildConnectionStringForStrategy(serverName, encrypt string, useServerSPN bool, spnHost string, certHostname string) string {
 	var parts []string
 
 	parts = append(parts, fmt.Sprintf("server=%s", serverName))
@@ -406,6 +824,9 @@ func (c *Client) buildConnectionStringForStrategy(serverName, encrypt string, us
 	// Handle encryption setting - supports "false", "true", "strict", "disable"
 	parts = append(parts, fmt.Sprintf("encrypt=%s", encrypt))
 	parts = append(parts, "TrustServerCertificate=true")
+	if certHostname != "" {
+		parts = append(parts, fmt.Sprintf("HostNameInCertificate=%s", certHostname))
+	}
 	parts = append(parts, "app name=MSSQLHound")
 
 	return strings.Join(parts, ";")
@@ -417,7 +838,7 @@ func (c *Client) buildConnectionString() string {
 	if !c.encrypt {
 		encrypt = "false"
 	}
-	return c.buildConnectionStringForStrategy(c.hostname, encrypt, true, c.hostname)
+	return c.buildConnectionStringForStrategy(c.hostname, encrypt, true, c.hostname, "")
 }
 
 // SetVerbose enables or disables verbose logging
@@ -439,6 +860,19 @@ func (c *Client) SetDomain(domain string) {
 func (c *Client) SetLDAPCredentials(ldapUser, ldapPassword string) {
 	c.ldapUser = ldapUser
 	c.ldapPassword = ldapPassword
+}
+
+// SetProxyDialer sets a SOCKS5 proxy dialer for all network operations.
+func (c *Client) SetProxyDialer(d interface {
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+}) {
+	c.proxyDialer = d
+}
+
+// SetEPAResult stores a pre-computed EPA test result on the client.
+// When set, collectEncryptionSettings will use this instead of running EPA tests.
+func (c *Client) SetEPAResult(result *EPATestResult) {
+	c.epaResult = result
 }
 
 // logVerbose logs a message only if verbose mode is enabled
@@ -504,6 +938,7 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 			Hostname: c.hostname, Port: port, InstanceName: c.instanceName,
 			Domain: epaDomain, Username: epaUsername, Password: c.ldapPassword,
 			TestMode: mode, Verbose: c.verbose,
+			ProxyDialer: c.proxyDialer,
 		}
 	}
 
@@ -514,21 +949,54 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 		// The normal TDS 7.x PRELOGIN failed. This may indicate the server
 		// enforces TDS 8.0 strict encryption (TLS before any TDS messages).
 		c.logVerbose("  Normal PRELOGIN failed (%v), trying TDS 8.0 strict encryption flow...", err)
-		_, strictErr := runEPATestStrict(ctx, baseConfig(EPATestNormal))
+		_, strictEncFlag, strictErr := runEPATestStrict(ctx, baseConfig(EPATestNormal))
 		if strictErr != nil {
 			return nil, fmt.Errorf("EPA prereq check failed (tried normal and TDS 8.0 strict): normal=%w, strict=%v", err, strictErr)
 		}
 		// TDS 8.0 strict encryption confirmed.
-		// In strict mode we cannot determine Force Encryption or EPA enforcement
-		// via NTLM AV_PAIR manipulation — additional research is required.
 		result.EncryptionFlag = encryptStrict
 		result.StrictEncryption = true
-		result.EPAStatus = "Unknown"
+		result.ForceEncryption = strictEncFlag == encryptReq
 		c.logVerbose("  Server uses TDS 8.0 strict encryption")
-		c.logVerbose("  Encryption flag: 0x%02X", encryptStrict)
+		c.logVerbose("  Encryption flag (from strict PRELOGIN): 0x%02X", strictEncFlag)
 		c.logVerbose("  Strict Encryption (TDS 8.0): Yes")
-		c.logVerbose("  Force Encryption: No")
-		c.logVerbose("  Extended Protection: Force Strict Encryption without Force Encryption requires additional research to determine (Off/Allowed/Required)")
+		c.logVerbose("  Force Encryption: %s", boolToYesNo(result.ForceEncryption))
+
+		// Determine EPA enforcement via channel binding tests over strict TLS.
+		// Strict mode is always encrypted, so test channel binding (like encryptReq path).
+		c.logVerbose("  Conducting logins while manipulating channel binding av pair over strict encrypted connection")
+
+		bogusResult, _, bogusErr := runEPATestStrict(ctx, baseConfig(EPATestBogusCBT))
+		if bogusErr != nil {
+			c.logVerbose("  Bogus CBT test (strict) failed: %v", bogusErr)
+			result.EPAStatus = "Unknown"
+			return result, nil
+		}
+
+		if bogusResult.IsUntrustedDomain {
+			// Bogus CBT rejected - EPA is enforcing channel binding
+			missingResult, _, missingErr := runEPATestStrict(ctx, baseConfig(EPATestMissingCBT))
+			if missingErr != nil {
+				c.logVerbose("  Missing CBT test (strict) failed: %v", missingErr)
+				result.EPAStatus = "Unknown"
+				return result, nil
+			}
+
+			result.NoCBTSuccess = missingResult.Success || missingResult.IsLoginFailed
+			if missingResult.IsUntrustedDomain {
+				result.EPAStatus = "Required"
+				c.logVerbose("  Extended Protection: Required (channel binding)")
+			} else {
+				result.EPAStatus = "Allowed"
+				c.logVerbose("  Extended Protection: Allowed (channel binding)")
+			}
+		} else {
+			// Bogus CBT accepted - EPA is Off
+			result.NoCBTSuccess = true
+			result.EPAStatus = "Off"
+			c.logVerbose("  Extended Protection: Off")
+		}
+
 		return result, nil
 	}
 
@@ -547,6 +1015,58 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 	}
 	result.UnmodifiedSuccess = prereqResult.Success
 	c.logVerbose("  Unmodified connection: %s", boolToSuccessFail(prereqResult.Success))
+
+	// Diagnostics: if Normal mode failed with "untrusted domain", run baseline tests to isolate.
+	if !prereqResult.Success && prereqResult.IsUntrustedDomain {
+		// Diagnostic 1: Raw target info baseline (like go-mssqldb - no EPA mods, no MIC)
+		// This tells us if base NTLM auth works at all.
+		c.logVerbose("  Running raw NTLM baseline diagnostic (no EPA mods, no MIC)...")
+		rawConfig := baseConfig(EPATestNormal)
+		rawConfig.UseRawTargetInfo = true
+		rawResult, _, rawErr := runEPATest(ctx, rawConfig)
+		if rawErr != nil {
+			c.logVerbose("  Raw NTLM baseline: connection error: %v", rawErr)
+		} else if rawResult.Success || (rawResult.IsLoginFailed && !rawResult.IsUntrustedDomain) {
+			c.logVerbose("  Raw NTLM baseline: SUCCESS - base NTLM auth works, issue is in EPA modifications")
+			c.logVerbose("  Raw NTLM result: success=%v, loginFailed=%v, error=%q",
+				rawResult.Success, rawResult.IsLoginFailed, rawResult.ErrorMessage)
+		} else {
+			c.logVerbose("  Raw NTLM baseline: FAILED - base NTLM auth does not work (domain/user/password issue?)")
+			c.logVerbose("  Raw NTLM result: untrustedDomain=%v, error=%q",
+				rawResult.IsUntrustedDomain, rawResult.ErrorMessage)
+		}
+
+		// Diagnostic 2: Raw baseline + client timestamp (isolate timestamp issues)
+		if rawResult != nil && rawResult.IsUntrustedDomain {
+			c.logVerbose("  Running raw NTLM + client timestamp diagnostic...")
+			rawTSConfig := baseConfig(EPATestNormal)
+			rawTSConfig.UseRawTargetInfo = true
+			rawTSConfig.UseClientTimestamp = true
+			rawTSResult, _, rawTSErr := runEPATest(ctx, rawTSConfig)
+			if rawTSErr != nil {
+				c.logVerbose("  Raw NTLM + client timestamp: connection error: %v", rawTSErr)
+			} else if rawTSResult.Success || (rawTSResult.IsLoginFailed && !rawTSResult.IsUntrustedDomain) {
+				c.logVerbose("  Raw NTLM + client timestamp: SUCCESS - server timestamp was the issue")
+			} else {
+				c.logVerbose("  Raw NTLM + client timestamp: STILL FAILED")
+				c.logVerbose("  Result: error=%q", rawTSResult.ErrorMessage)
+			}
+		}
+
+		// Diagnostic 3: MIC bypass (EPA mods present but no MIC/MsvAvFlags)
+		c.logVerbose("  Running MIC bypass diagnostic...")
+		noMICConfig := baseConfig(EPATestNormal)
+		noMICConfig.DisableMIC = true
+		noMICResult, _, noMICErr := runEPATest(ctx, noMICConfig)
+		if noMICErr != nil {
+			c.logVerbose("  MIC bypass diagnostic: connection error: %v", noMICErr)
+		} else if noMICResult.Success || (noMICResult.IsLoginFailed && !noMICResult.IsUntrustedDomain) {
+			c.logVerbose("  MIC bypass diagnostic: SUCCESS - MIC computation is the root cause")
+		} else {
+			c.logVerbose("  MIC bypass diagnostic: STILL FAILED - issue is NOT (only) the MIC")
+			c.logVerbose("  MIC bypass result: error=%q", noMICResult.ErrorMessage)
+		}
+	}
 
 	// Step 2: Test based on encryption setting (matching Python mssql.py flow)
 	if encFlag == encryptReq {
@@ -662,8 +1182,23 @@ func (c *Client) sendPrelogin(ctx context.Context) (*preloginResult, error) {
 
 	// Connect via TCP
 	addr := fmt.Sprintf("%s:%d", c.hostname, port)
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	var conn net.Conn
+	var err error
+	if c.proxyDialer != nil {
+		// Resolve hostname to IP first — SOCKS proxies often can't resolve
+		// internal DNS names.
+		dialAddr := addr
+		if net.ParseIP(c.hostname) == nil {
+			addrs, resolveErr := net.DefaultResolver.LookupHost(ctx, c.hostname)
+			if resolveErr == nil && len(addrs) > 0 {
+				dialAddr = fmt.Sprintf("%s:%d", addrs[0], port)
+			}
+		}
+		conn, err = c.proxyDialer.DialContext(ctx, "tcp", dialAddr)
+	} else {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err = dialer.DialContext(ctx, "tcp", addr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("TCP connection failed: %w", err)
 	}
@@ -809,6 +1344,10 @@ func parsePreloginResponse(data []byte) (*preloginResult, error) {
 
 // resolveInstancePort resolves the port for a named SQL Server instance using SQL Browser
 func (c *Client) resolveInstancePort(ctx context.Context) (int, error) {
+	if c.proxyDialer != nil {
+		return 0, fmt.Errorf("SQL Browser UDP resolution is not supported through a SOCKS5 proxy; please specify the port explicitly (e.g., host:port or host\\instance:port)")
+	}
+
 	addr := fmt.Sprintf("%s:1434", c.hostname) // SQL Browser UDP port
 
 	conn, err := net.DialTimeout("udp", addr, 5*time.Second)
@@ -2678,26 +3217,20 @@ func (c *Client) collectAuthenticationMode(ctx context.Context, info *types.Serv
 // It performs actual EPA connection testing when domain credentials are available,
 // falling back to registry-based detection otherwise.
 func (c *Client) collectEncryptionSettings(ctx context.Context, info *types.ServerInfo) error {
-	// Always attempt EPA testing if we have LDAP/domain credentials
-	if c.ldapUser != "" && c.ldapPassword != "" {
-		epaResult, err := c.TestEPA(ctx)
-		if err != nil {
-			c.logVerbose("Warning: EPA testing failed: %v, falling back to registry", err)
+	// Use pre-computed EPA result if available (EPA runs before Connect now)
+	if c.epaResult != nil {
+		if c.epaResult.ForceEncryption {
+			info.ForceEncryption = "Yes"
 		} else {
-			// Use results from EPA testing
-			if epaResult.ForceEncryption {
-				info.ForceEncryption = "Yes"
-			} else {
-				info.ForceEncryption = "No"
-			}
-			if epaResult.StrictEncryption {
-				info.StrictEncryption = "Yes"
-			} else {
-				info.StrictEncryption = "No"
-			}
-			info.ExtendedProtection = epaResult.EPAStatus
-			return nil
+			info.ForceEncryption = "No"
 		}
+		if c.epaResult.StrictEncryption {
+			info.StrictEncryption = "Yes"
+		} else {
+			info.StrictEncryption = "No"
+		}
+		info.ExtendedProtection = c.epaResult.EPAStatus
+		return nil
 	}
 
 	// Fall back to registry-based detection (or primary method when not verbose)

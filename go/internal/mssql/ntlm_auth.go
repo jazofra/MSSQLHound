@@ -9,9 +9,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf16"
 
 	"golang.org/x/crypto/md4"
@@ -33,21 +35,21 @@ const (
 
 // NTLM negotiate flags
 const (
-	ntlmFlagUnicode                  uint32 = 0x00000001
-	ntlmFlagOEM                      uint32 = 0x00000002
-	ntlmFlagRequestTarget            uint32 = 0x00000004
-	ntlmFlagSign                     uint32 = 0x00000010
-	ntlmFlagSeal                     uint32 = 0x00000020
-	ntlmFlagNTLM                     uint32 = 0x00000200
-	ntlmFlagAlwaysSign               uint32 = 0x00008000
-	ntlmFlagDomainSupplied           uint32 = 0x00001000
-	ntlmFlagWorkstationSupplied      uint32 = 0x00002000
-	ntlmFlagExtendedSessionSecurity  uint32 = 0x00080000
-	ntlmFlagTargetInfo               uint32 = 0x00800000
-	ntlmFlagVersion                  uint32 = 0x02000000
-	ntlmFlag128                      uint32 = 0x20000000
-	ntlmFlagKeyExch                  uint32 = 0x40000000
-	ntlmFlag56                       uint32 = 0x80000000
+	ntlmFlagUnicode                 uint32 = 0x00000001
+	ntlmFlagOEM                     uint32 = 0x00000002
+	ntlmFlagRequestTarget           uint32 = 0x00000004
+	ntlmFlagSign                    uint32 = 0x00000010
+	ntlmFlagSeal                    uint32 = 0x00000020
+	ntlmFlagNTLM                    uint32 = 0x00000200
+	ntlmFlagAlwaysSign              uint32 = 0x00008000
+	ntlmFlagDomainSupplied          uint32 = 0x00001000
+	ntlmFlagWorkstationSupplied     uint32 = 0x00002000
+	ntlmFlagExtendedSessionSecurity uint32 = 0x00080000
+	ntlmFlagTargetInfo              uint32 = 0x00800000
+	ntlmFlagVersion                 uint32 = 0x02000000
+	ntlmFlag128                     uint32 = 0x20000000
+	ntlmFlagKeyExch                 uint32 = 0x40000000
+	ntlmFlag56                      uint32 = 0x80000000
 )
 
 // MsvAvFlags bit values
@@ -93,15 +95,18 @@ type ntlmAuth struct {
 
 	testMode           EPATestMode
 	channelBindingHash []byte // 16-byte MD5 of SEC_CHANNEL_BINDINGS
+	disableMIC         bool   // When true, omit MsvAvFlags and MIC from Type3 (diagnostic bypass)
+	useRawTargetInfo   bool   // When true, use server's target info unmodified (no EPA, no MIC) - diagnostic baseline
+	useClientTimestamp bool   // When true, use time.Now() instead of server's MsvAvTimestamp (diagnostic)
 
 	// State preserved across message generation
 	negotiateMsg    []byte
-	challengeMsg    []byte   // Raw Type2 bytes from server (needed for MIC computation)
+	challengeMsg    []byte // Raw Type2 bytes from server (needed for MIC computation)
 	serverChallenge [8]byte
 	targetInfoRaw   []byte
 	negotiateFlags  uint32
-	timestamp       []byte   // 8-byte FILETIME from server
-	serverDomain    string   // NetBIOS domain name from Type2 MsvAvNbDomainName (for NTLMv2 hash)
+	timestamp       []byte // 8-byte FILETIME from server
+	serverDomain    string // NetBIOS domain name from Type2 MsvAvNbDomainName (for NTLMv2 hash)
 }
 
 func newNTLMAuth(domain, username, password, targetName string) *ntlmAuth {
@@ -124,7 +129,78 @@ func (a *ntlmAuth) SetChannelBindingHash(hash []byte) {
 	a.channelBindingHash = hash
 }
 
+// SetDisableMIC disables MIC computation and MsvAvFlags in the Type3 message.
+// This is a diagnostic tool to isolate whether incorrect MIC is causing auth failures.
+func (a *ntlmAuth) SetDisableMIC(disable bool) {
+	a.disableMIC = disable
+}
+
+// SetUseRawTargetInfo enables raw target info mode: uses the server's target info
+// unmodified (no MsvAvFlags, no CBT, no SPN, no MIC). This matches go-mssqldb's
+// baseline NTLM behavior and is used as a diagnostic to verify base NTLM auth works.
+func (a *ntlmAuth) SetUseRawTargetInfo(raw bool) {
+	a.useRawTargetInfo = raw
+}
+
+// SetUseClientTimestamp enables client-generated timestamp instead of server's
+// MsvAvTimestamp. go-mssqldb uses time.Now() for the blob timestamp. This is a
+// diagnostic to isolate timestamp-related auth failures.
+func (a *ntlmAuth) SetUseClientTimestamp(use bool) {
+	a.useClientTimestamp = use
+}
+
+// GetAuthDomain returns the domain that will be used for NTLMv2 hash computation.
+func (a *ntlmAuth) GetAuthDomain() string {
+	return a.domain
+}
+
+// ComputeNTLMv2HashHex returns the hex-encoded NTLMv2 hash for diagnostic logging.
+func (a *ntlmAuth) ComputeNTLMv2HashHex() string {
+	hash := computeNTLMv2Hash(a.password, a.username, a.domain)
+	return fmt.Sprintf("%x", hash)
+}
+
+// GetTargetInfoPairs returns the parsed AV_PAIRs from the server's Type2 target info
+// for diagnostic logging.
+func (a *ntlmAuth) GetTargetInfoPairs() []ntlmAVPair {
+	if a.targetInfoRaw == nil {
+		return nil
+	}
+	return parseAVPairs(a.targetInfoRaw)
+}
+
+// AVPairName returns a human-readable name for an AV_PAIR ID.
+func AVPairName(id uint16) string {
+	switch id {
+	case avIDMsvAvEOL:
+		return "MsvAvEOL"
+	case avIDMsvAvNbComputerName:
+		return "MsvAvNbComputerName"
+	case avIDMsvAvNbDomainName:
+		return "MsvAvNbDomainName"
+	case avIDMsvAvDNSComputerName:
+		return "MsvAvDNSComputerName"
+	case avIDMsvAvDNSDomainName:
+		return "MsvAvDNSDomainName"
+	case avIDMsvAvDNSTreeName:
+		return "MsvAvDNSTreeName"
+	case avIDMsvAvFlags:
+		return "MsvAvFlags"
+	case avIDMsvAvTimestamp:
+		return "MsvAvTimestamp"
+	case avIDMsvAvTargetName:
+		return "MsvAvTargetName"
+	case avIDMsvChannelBindings:
+		return "MsvAvChannelBindings"
+	default:
+		return fmt.Sprintf("Unknown(0x%04X)", id)
+	}
+}
+
 // CreateNegotiateMessage builds NTLM Type1 (Negotiate) message.
+// Uses minimal flags without domain payload. Including a domain in Type1 causes
+// SQL Server to reject immediately with "untrusted domain" before even sending
+// a Type2 challenge, so we omit it. The domain is provided in the Type3 message.
 func (a *ntlmAuth) CreateNegotiateMessage() []byte {
 	flags := ntlmFlagUnicode |
 		ntlmFlagOEM |
@@ -145,10 +221,10 @@ func (a *ntlmAuth) CreateNegotiateMessage() []byte {
 	// Domain Name Fields (empty)
 	// Workstation Fields (empty)
 	// Version: 10.0.20348 (Windows Server 2022)
-	msg[32] = 10  // Major
-	msg[33] = 0   // Minor
+	msg[32] = 10                                     // Major
+	msg[33] = 0                                      // Minor
 	binary.LittleEndian.PutUint16(msg[34:36], 20348) // Build
-	msg[39] = 0x0F // NTLMSSP revision
+	msg[39] = 0x0F                                   // NTLMSSP revision
 
 	a.negotiateMsg = make([]byte, len(msg))
 	copy(a.negotiateMsg, msg)
@@ -216,43 +292,59 @@ func (a *ntlmAuth) CreateAuthenticateMessage() ([]byte, error) {
 		return nil, fmt.Errorf("no target info available from challenge")
 	}
 
-	// Build modified target info with EPA-controlled AV_PAIRs
-	modifiedTargetInfo := a.buildModifiedTargetInfo()
-
 	// Generate client challenge (8 random bytes)
 	var clientChallenge [8]byte
 	if _, err := rand.Read(clientChallenge[:]); err != nil {
 		return nil, fmt.Errorf("generating client challenge: %w", err)
 	}
 
-	// Use server timestamp if available, otherwise generate one
-	timestamp := a.timestamp
-	if timestamp == nil {
-		timestamp = make([]byte, 8)
-		// Use a reasonable default timestamp
+	// Determine which target info to use
+	var targetInfoForBlob []byte
+	if a.useRawTargetInfo {
+		// Diagnostic mode: use server's raw target info unmodified (like go-mssqldb)
+		targetInfoForBlob = a.targetInfoRaw
+	} else {
+		// Normal mode: build modified target info with EPA-controlled AV_PAIRs
+		targetInfoForBlob = a.buildModifiedTargetInfo()
 	}
 
-	// Compute NTLMv2 hash using the server's NetBIOS domain name (from Type2 MsvAvNbDomainName)
-	// per MS-NLMP Section 3.3.2: "the client SHOULD use [MsvAvNbDomainName] for UserDom"
-	authDomain := a.domain
-	if a.serverDomain != "" {
-		authDomain = a.serverDomain
+	// Use server timestamp if available, otherwise generate one.
+	// When useClientTimestamp is set, generate a Windows FILETIME from time.Now()
+	// (this matches what some implementations like go-mssqldb do).
+	var timestamp []byte
+	if a.useClientTimestamp {
+		timestamp = make([]byte, 8)
+		// Windows FILETIME: 100-nanosecond intervals since January 1, 1601
+		// Unix epoch is January 1, 1970 = 116444736000000000 FILETIME ticks
+		const windowsEpochDiff = 116444736000000000
+		ft := uint64(time.Now().UnixNano()/100) + windowsEpochDiff
+		binary.LittleEndian.PutUint64(timestamp, ft)
+	} else if a.timestamp != nil {
+		timestamp = a.timestamp
+	} else {
+		timestamp = make([]byte, 8)
 	}
+
+	// Compute NTLMv2 hash using the user-provided domain name.
+	// Although MS-NLMP Section 3.3.2 says "UserDom SHOULD be set to MsvAvNbDomainName",
+	// in practice Windows SSPI, go-mssqldb, and impacket all use the user-provided domain.
+	// The DC validates against the account's actual domain (stored as uppercase in AD),
+	// so the user-provided domain should match what the DC expects.
+	// Tested both "MAYYHEM" (user) and "mayyhem" (server) - neither helped, confirming
+	// the domain case is not the root cause of auth failures.
+	authDomain := a.domain
 	ntlmV2Hash := computeNTLMv2Hash(a.password, a.username, authDomain)
 
-	// Build the NtChallengeResponse blob
+	// Build the NtChallengeResponse blob (NTLMv2_CLIENT_CHALLENGE / temp)
 	// Structure: ResponseType(1) + HiResponseType(1) + Reserved1(2) + Reserved2(4) +
 	//            Timestamp(8) + ClientChallenge(8) + Reserved3(4) + TargetInfo + Reserved4(4)
-	blobLen := 28 + len(modifiedTargetInfo) + 4
+	blobLen := 28 + len(targetInfoForBlob) + 4
 	blob := make([]byte, blobLen)
 	blob[0] = 0x01 // ResponseType
 	blob[1] = 0x01 // HiResponseType
-	// Reserved1 and Reserved2 are zero
 	copy(blob[8:16], timestamp)
 	copy(blob[16:24], clientChallenge[:])
-	// Reserved3 is zero
-	copy(blob[28:], modifiedTargetInfo)
-	// Reserved4 (trailing 4 zero bytes)
+	copy(blob[28:], targetInfoForBlob)
 
 	// Compute NTProofStr = HMAC_MD5(NTLMv2Hash, ServerChallenge + Blob)
 	challengeAndBlob := make([]byte, 8+len(blob))
@@ -266,19 +358,18 @@ func (a *ntlmAuth) CreateAuthenticateMessage() ([]byte, error) {
 	// Session base key = HMAC_MD5(NTLMv2Hash, NTProofStr)
 	sessionBaseKey := hmacMD5Sum(ntlmV2Hash, ntProofStr)
 
-	// LmChallengeResponse for NTLMv2 with target info: 24 zero bytes
-	lmResponse := make([]byte, 24)
+	// LmChallengeResponse: compute LMv2 (HMAC_MD5(NTLMv2Hash, serverChallenge + clientChallenge) + clientChallenge)
+	// This matches go-mssqldb's behavior.
+	challengeAndNonce := make([]byte, 16)
+	copy(challengeAndNonce[:8], a.serverChallenge[:])
+	copy(challengeAndNonce[8:], clientChallenge[:])
+	lmHash := hmacMD5Sum(ntlmV2Hash, challengeAndNonce)
+	lmResponse := append(lmHash, clientChallenge[:]...)
 
-	// Build the authenticate flags
-	flags := ntlmFlagUnicode |
-		ntlmFlagRequestTarget |
-		ntlmFlagNTLM |
-		ntlmFlagAlwaysSign |
-		ntlmFlagExtendedSessionSecurity |
-		ntlmFlagTargetInfo |
-		ntlmFlagVersion |
-		ntlmFlag128 |
-		ntlmFlag56
+	// Use the server's negotiate flags from Type2 in Type3 (matching go-mssqldb behavior).
+	// The server sends its supported flags in the challenge; the client echoes them back
+	// to indicate agreement on the negotiated capabilities.
+	flags := a.negotiateFlags
 
 	// Build Type3 message (use same authDomain for consistency)
 	domain16 := encodeUTF16LE(authDomain)
@@ -291,7 +382,13 @@ func (a *ntlmAuth) CreateAuthenticateMessage() ([]byte, error) {
 	userLen := len(user16)
 	wsLen := len(workstation16)
 
-	// Header is 88 bytes (includes 16-byte MIC field)
+	// Determine whether to include MIC.
+	// MIC is included when we modify target info (EPA modes) and MIC is not explicitly disabled.
+	// Raw target info mode acts like go-mssqldb: 88-byte header with zeroed MIC, no computation.
+	includeMIC := !a.disableMIC && !a.useRawTargetInfo
+
+	// Always use 88-byte header (matching go-mssqldb) to include the MIC field.
+	// Even when MIC is not computed, the field is present but zeroed.
 	headerSize := 88
 	totalLen := headerSize + lmLen + ntLen + domainLen + userLen + wsLen
 
@@ -344,17 +441,16 @@ func (a *ntlmAuth) CreateAuthenticateMessage() ([]byte, error) {
 	// Negotiate flags
 	binary.LittleEndian.PutUint32(msg[60:64], flags)
 
-	// Version: 10.0.20348
-	msg[64] = 10
-	msg[65] = 0
-	binary.LittleEndian.PutUint16(msg[66:68], 20348)
-	msg[71] = 0x0F // NTLMSSP revision
+	// Version (zeroed, matching go-mssqldb)
+	// bytes 64-71 are already zero from make()
 
-	// MIC (16 bytes at offset 72): compute over all three NTLM messages
-	// Must use the raw Type2 bytes from the server (not reconstructed)
-	// First zero it out (it's already zero), compute the MIC, then fill it in
-	mic := computeMIC(sessionBaseKey, a.negotiateMsg, a.challengeMsg, msg)
-	copy(msg[72:88], mic)
+	// MIC (16 bytes at offset 72-87):
+	// Always present as a field (88-byte header), but only computed when EPA modifications
+	// are active. When raw target info is used or MIC is disabled, the field stays zeroed.
+	if includeMIC {
+		mic := computeMIC(sessionBaseKey, a.negotiateMsg, a.challengeMsg, msg)
+		copy(msg[72:88], mic)
+	}
 
 	return msg, nil
 }
@@ -382,10 +478,12 @@ func (a *ntlmAuth) buildModifiedTargetInfo() []byte {
 		}
 	}
 
-	// Add MsvAvFlags with MIC present bit
-	flagsValue := make([]byte, 4)
-	binary.LittleEndian.PutUint32(flagsValue, msvAvFlagMICPresent)
-	filtered = append(filtered, ntlmAVPair{ID: avIDMsvAvFlags, Value: flagsValue})
+	// Add MsvAvFlags with MIC present bit (unless MIC is disabled for diagnostics)
+	if !a.disableMIC {
+		flagsValue := make([]byte, 4)
+		binary.LittleEndian.PutUint32(flagsValue, msvAvFlagMICPresent)
+		filtered = append(filtered, ntlmAVPair{ID: avIDMsvAvFlags, Value: flagsValue})
+	}
 
 	// Add Channel Binding and Target Name based on test mode
 	switch a.testMode {
@@ -505,51 +603,61 @@ func computeMIC(sessionBaseKey, negotiateMsg, challengeMsg, authenticateMsg []by
 	return hmacMD5Sum(sessionBaseKey, data)
 }
 
-// computeChannelBindingHash computes the MD5 hash of the SEC_CHANNEL_BINDINGS
-// structure for the MsvAvChannelBindings AV_PAIR.
-// The input is the DER-encoded TLS server certificate.
-func computeChannelBindingHash(certDER []byte) []byte {
-	// Compute certificate hash using SHA-256 (tls-server-end-point per RFC 5929)
-	certHash := sha256.Sum256(certDER)
-
-	// Build SEC_CHANNEL_BINDINGS structure:
-	// Initiator addr type (4 bytes): 0
-	// Initiator addr length (4 bytes): 0
-	// Acceptor addr type (4 bytes): 0
-	// Acceptor addr length (4 bytes): 0
-	// Application data length (4 bytes): len("tls-server-end-point:" + certHash)
-	// Application data: "tls-server-end-point:" + certHash
-
-	prefix := []byte("tls-server-end-point:")
-	appData := append(prefix, certHash[:]...)
+// computeCBTHash computes the MD5 hash of the SEC_CHANNEL_BINDINGS structure
+// for the MsvAvChannelBindings AV_PAIR.
+//
+// The SEC_CHANNEL_BINDINGS structure is:
+//
+//	Initiator addr type (4 bytes): 0
+//	Initiator addr length (4 bytes): 0
+//	Acceptor addr type (4 bytes): 0
+//	Acceptor addr length (4 bytes): 0
+//	Application data length (4 bytes): len(appData)
+//	Application data: prefix + bindingValue
+func computeCBTHash(prefix string, bindingValue []byte) []byte {
+	appData := append([]byte(prefix), bindingValue...)
 	appDataLen := len(appData)
 
-	// Total structure: 20 bytes header + 4 bytes app data length + app data
-	// Actually the SEC_CHANNEL_BINDINGS struct is:
-	// dwInitiatorAddrType (4) + cbInitiatorLength (4) +
-	// dwAcceptorAddrType (4) + cbAcceptorLength (4) +
-	// cbApplicationDataLength (4) = 20 bytes
-	// Followed by the application data
-
+	// 20-byte header (5 x uint32) + application data
 	structure := make([]byte, 20+appDataLen)
-	// All initiator/acceptor fields are zero
 	binary.LittleEndian.PutUint32(structure[16:20], uint32(appDataLen))
 	copy(structure[20:], appData)
 
-	// MD5 hash of the entire structure
 	hash := md5.Sum(structure)
 	return hash[:]
 }
 
-// getChannelBindingHashFromTLS extracts the TLS server certificate and computes the CBT hash.
-func getChannelBindingHashFromTLS(tlsConn *tls.Conn) ([]byte, error) {
+// certHashForEndpoint returns the hash of a DER-encoded certificate per RFC 5929
+// Section 4.1 (tls-server-end-point). The hash algorithm depends on the
+// certificate's signature algorithm: SHA-256 for MD5/SHA-1 signed certs,
+// otherwise the hash from the signature algorithm. In practice, most SQL Server
+// certs use SHA-256.
+func certHashForEndpoint(cert *x509.Certificate) []byte {
+	// RFC 5929 Section 4.1: If the certificate's signatureAlgorithm uses
+	// MD5 or SHA-1, use SHA-256. Otherwise use the signature's hash.
+	// SHA-256 covers the vast majority of certs in practice.
+	h := sha256.Sum256(cert.Raw)
+	return h[:]
+}
+
+// getChannelBindingHashFromTLS computes the CBT hash from a TLS connection.
+// For TLS 1.2: uses "tls-unique" (TLS Finished message), matching impacket.
+// For TLS 1.3: uses "tls-server-end-point" (cert hash), since tls-unique
+// was removed in TLS 1.3 (RFC 8446).
+func getChannelBindingHashFromTLS(tlsConn *tls.Conn) ([]byte, string, error) {
 	state := tlsConn.ConnectionState()
-	if len(state.PeerCertificates) == 0 {
-		return nil, fmt.Errorf("no server certificate in TLS connection")
+
+	// Prefer tls-unique (works for TLS 1.2, matches impacket/Python)
+	if len(state.TLSUnique) > 0 {
+		return computeCBTHash("tls-unique:", state.TLSUnique), "tls-unique", nil
 	}
 
-	certDER := state.PeerCertificates[0].Raw
-	return computeChannelBindingHash(certDER), nil
+	// Fallback to tls-server-end-point for TLS 1.3
+	if len(state.PeerCertificates) == 0 {
+		return nil, "", fmt.Errorf("no TLSUnique and no server certificate available")
+	}
+	certHash := certHashForEndpoint(state.PeerCertificates[0])
+	return computeCBTHash("tls-server-end-point:", certHash), "tls-server-end-point", nil
 }
 
 // computeSPN builds the Service Principal Name for NTLM service binding.

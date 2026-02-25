@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/SpecterOps/MSSQLHound/internal/collector"
+	"github.com/SpecterOps/MSSQLHound/internal/proxydialer"
 	"github.com/spf13/cobra"
 )
 
@@ -21,9 +22,8 @@ var (
 	serverList       string
 	userID           string
 	password         string
-	domain           string
-	domainController string
-	dcIP             string
+	domain string
+	dcIP   string
 	dnsResolver      string
 	ldapUser         string
 	ldapPassword     string
@@ -52,6 +52,9 @@ var (
 
 	// Concurrency
 	workers int
+
+	// Proxy
+	proxyAddr string
 )
 
 func main() {
@@ -75,8 +78,7 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	rootCmd.Flags().StringVarP(&userID, "user", "u", "", "SQL login username")
 	rootCmd.Flags().StringVarP(&password, "password", "p", "", "SQL login password")
 	rootCmd.Flags().StringVarP(&domain, "domain", "d", "", "Domain to use for name and SID resolution")
-	rootCmd.Flags().StringVar(&domainController, "dc", "", "Domain controller to use for resolution")
-	rootCmd.Flags().StringVar(&dcIP, "dc-ip", "", "Domain controller IP address (will be used as DNS resolver if --dns-resolver not specified)")
+	rootCmd.Flags().StringVar(&dcIP, "dc-ip", "", "Domain controller hostname or IP (used for LDAP and as DNS resolver if --dns-resolver not specified)")
 	rootCmd.Flags().StringVar(&dnsResolver, "dns-resolver", "", "DNS resolver IP address for domain lookups")
 	rootCmd.Flags().StringVar(&ldapUser, "ldap-user", "", "LDAP user (DOMAIN\\user or user@domain) for GSSAPI/Kerberos bind")
 	rootCmd.Flags().StringVar(&ldapPassword, "ldap-password", "", "LDAP password for GSSAPI/Kerberos bind")
@@ -106,6 +108,9 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	// Concurrency flags
 	rootCmd.Flags().IntVarP(&workers, "workers", "w", 0, "Number of concurrent workers (0 = sequential processing)")
 
+	// Proxy flags
+	rootCmd.Flags().StringVar(&proxyAddr, "proxy", "", "SOCKS5 proxy address (host:port or socks5://[user:pass@]host:port)")
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -127,14 +132,27 @@ func run(cmd *cobra.Command, args []string) error {
 
 	if resolver != "" {
 		fmt.Printf("Using custom DNS resolver: %s\n", resolver)
-		net.DefaultResolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		var dnsDialFunc func(ctx context.Context, network, address string) (net.Conn, error)
+		if proxyAddr != "" {
+			pd, err := proxydialer.New(proxyAddr)
+			if err != nil {
+				return fmt.Errorf("failed to create proxy dialer for DNS: %w", err)
+			}
+			dnsDialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
+				// Force TCP: SOCKS5 doesn't support UDP, and DNS works fine over TCP
+				return pd.DialContext(ctx, "tcp", net.JoinHostPort(resolver, "53"))
+			}
+		} else {
+			dnsDialFunc = func(ctx context.Context, network, address string) (net.Conn, error) {
 				d := net.Dialer{
 					Timeout: time.Millisecond * time.Duration(10000),
 				}
 				return d.DialContext(ctx, network, net.JoinHostPort(resolver, "53"))
-			},
+			}
+		}
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+			Dial:     dnsDialFunc,
 		}
 	}
 
@@ -157,7 +175,6 @@ func run(cmd *cobra.Command, args []string) error {
 		UserID:                          userID,
 		Password:                        password,
 		Domain:                          strings.ToUpper(domain),
-		DomainController:                domainController,
 		DCIP:                            dcIP,
 		DNSResolver:                     dnsResolver,
 		LDAPUser:                        effectiveLDAPUser,
@@ -179,6 +196,18 @@ func run(cmd *cobra.Command, args []string) error {
 		MemoryThresholdPercent:          memoryThresholdPercent,
 		FileSizeUpdateInterval:          fileSizeUpdateInterval,
 		Workers:                         workers,
+		ProxyAddr:                       proxyAddr,
+	}
+
+	if proxyAddr != "" {
+		fmt.Printf("SOCKS5 proxy configured: %s\n", proxyAddr)
+		fmt.Println("  Note: SQL Browser (UDP) resolution is not supported through SOCKS5.")
+		fmt.Println("  Named instances must include an explicit port (e.g., host\\instance:1433).")
+		if resolver == "" {
+			fmt.Println("  Warning: No DNS resolver specified. DNS will resolve locally, not through the proxy.")
+			fmt.Println("  Consider using --dns-resolver or --dc-ip for remote DNS resolution.")
+		}
+		fmt.Println()
 	}
 
 	// Create and run collector
