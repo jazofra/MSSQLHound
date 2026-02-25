@@ -465,47 +465,12 @@ func (c *Client) connectNative(ctx context.Context) error {
 		)
 	}
 
-	// Diagnostic: test go-mssqldb's built-in NTLM (without our EPA provider).
-	// This tells us if the issue is in our custom NTLM or something more fundamental.
-	// The built-in go-mssqldb ntlm package (integratedauth/ntlm) does NOT support EPA
-	// channel binding but should still handle basic NTLM auth.
-	if c.verbose && strings.Contains(c.userID, "\\") {
-		// Build a connection string that uses DOMAIN\user format to trigger go-mssqldb's
-		// built-in NTLM. Do NOT set the authenticator parameter so it uses the default
-		// ntlm provider registered via init().
-		port := c.port
-		if port == 0 {
-			port = 1433
-		}
-		diagConnStr := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;encrypt=true;TrustServerCertificate=true;app name=MSSQLHound-diag",
-			c.hostname, port, c.userID, c.password)
-		c.logVerbose("Testing go-mssqldb built-in NTLM (no EPA provider): server=%s;port=%d;user id=%s;encrypt=true",
-			c.hostname, port, c.userID)
-		diagConfig, diagParseErr := msdsn.Parse(diagConnStr)
-		if diagParseErr == nil {
-			diagConnector := mssqldb.NewConnectorConfig(diagConfig)
-			if c.proxyDialer != nil {
-				diagConnector.Dialer = c.proxyDialer
-			}
-			diagDB := sql.OpenDB(diagConnector)
-			diagCtx, diagCancel := context.WithTimeout(ctx, 10*time.Second)
-			diagErr := diagDB.PingContext(diagCtx)
-			diagCancel()
-			diagDB.Close()
-			if diagErr != nil {
-				c.logVerbose("  go-mssqldb built-in NTLM: FAILED - %v", diagErr)
-			} else {
-				c.logVerbose("  go-mssqldb built-in NTLM: SUCCESS - built-in NTLM works, issue is in our custom NTLM!")
-			}
-		}
-	}
-
 	// When EPA is Required, register a custom NTLM auth provider that includes
 	// channel binding tokens. go-mssqldb's built-in NTLM on Linux does NOT
 	// support EPA, so without this, all strategies fail with "untrusted domain".
 	var epaProvider *epaAuthProvider
 	if c.epaResult != nil && (c.epaResult.EPAStatus == "Required" || c.epaResult.EPAStatus == "Allowed") {
-		epaProvider = &epaAuthProvider{}
+		epaProvider = &epaAuthProvider{verbose: c.verbose}
 		port := c.port
 		if port == 0 {
 			port = 1433
@@ -557,6 +522,10 @@ func (c *Client) connectNative(ctx context.Context) error {
 			}
 			db.Close()
 			c.logVerbose("  Strategy 'EPA+strict-TLS' failed: %v", err)
+			if IsAuthError(err) {
+				c.logVerbose("  Authentication error detected, stopping to prevent account lockout")
+				return fmt.Errorf("EPA+strict-TLS authentication failed: %w", err)
+			}
 		}
 	}
 
@@ -604,6 +573,10 @@ func (c *Client) connectNative(ctx context.Context) error {
 			}
 			db.Close()
 			c.logVerbose("  Strategy 'EPA+TDS-TLS' failed: %v", err)
+			if IsAuthError(err) {
+				c.logVerbose("  Authentication error detected, stopping to prevent account lockout")
+				return fmt.Errorf("EPA+TDS-TLS authentication failed: %w", err)
+			}
 		}
 	}
 
@@ -682,6 +655,10 @@ func (c *Client) connectNative(ctx context.Context) error {
 			db.Close()
 			lastErr = err
 			c.logVerbose("  Strategy '%s' failed to connect: %v", strategy.name, err)
+			if IsAuthError(err) {
+				c.logVerbose("  Authentication error detected, stopping strategy loop to prevent account lockout")
+				break
+			}
 			continue
 		}
 
@@ -1015,58 +992,6 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 	}
 	result.UnmodifiedSuccess = prereqResult.Success
 	c.logVerbose("  Unmodified connection: %s", boolToSuccessFail(prereqResult.Success))
-
-	// Diagnostics: if Normal mode failed with "untrusted domain", run baseline tests to isolate.
-	if !prereqResult.Success && prereqResult.IsUntrustedDomain {
-		// Diagnostic 1: Raw target info baseline (like go-mssqldb - no EPA mods, no MIC)
-		// This tells us if base NTLM auth works at all.
-		c.logVerbose("  Running raw NTLM baseline diagnostic (no EPA mods, no MIC)...")
-		rawConfig := baseConfig(EPATestNormal)
-		rawConfig.UseRawTargetInfo = true
-		rawResult, _, rawErr := runEPATest(ctx, rawConfig)
-		if rawErr != nil {
-			c.logVerbose("  Raw NTLM baseline: connection error: %v", rawErr)
-		} else if rawResult.Success || (rawResult.IsLoginFailed && !rawResult.IsUntrustedDomain) {
-			c.logVerbose("  Raw NTLM baseline: SUCCESS - base NTLM auth works, issue is in EPA modifications")
-			c.logVerbose("  Raw NTLM result: success=%v, loginFailed=%v, error=%q",
-				rawResult.Success, rawResult.IsLoginFailed, rawResult.ErrorMessage)
-		} else {
-			c.logVerbose("  Raw NTLM baseline: FAILED - base NTLM auth does not work (domain/user/password issue?)")
-			c.logVerbose("  Raw NTLM result: untrustedDomain=%v, error=%q",
-				rawResult.IsUntrustedDomain, rawResult.ErrorMessage)
-		}
-
-		// Diagnostic 2: Raw baseline + client timestamp (isolate timestamp issues)
-		if rawResult != nil && rawResult.IsUntrustedDomain {
-			c.logVerbose("  Running raw NTLM + client timestamp diagnostic...")
-			rawTSConfig := baseConfig(EPATestNormal)
-			rawTSConfig.UseRawTargetInfo = true
-			rawTSConfig.UseClientTimestamp = true
-			rawTSResult, _, rawTSErr := runEPATest(ctx, rawTSConfig)
-			if rawTSErr != nil {
-				c.logVerbose("  Raw NTLM + client timestamp: connection error: %v", rawTSErr)
-			} else if rawTSResult.Success || (rawTSResult.IsLoginFailed && !rawTSResult.IsUntrustedDomain) {
-				c.logVerbose("  Raw NTLM + client timestamp: SUCCESS - server timestamp was the issue")
-			} else {
-				c.logVerbose("  Raw NTLM + client timestamp: STILL FAILED")
-				c.logVerbose("  Result: error=%q", rawTSResult.ErrorMessage)
-			}
-		}
-
-		// Diagnostic 3: MIC bypass (EPA mods present but no MIC/MsvAvFlags)
-		c.logVerbose("  Running MIC bypass diagnostic...")
-		noMICConfig := baseConfig(EPATestNormal)
-		noMICConfig.DisableMIC = true
-		noMICResult, _, noMICErr := runEPATest(ctx, noMICConfig)
-		if noMICErr != nil {
-			c.logVerbose("  MIC bypass diagnostic: connection error: %v", noMICErr)
-		} else if noMICResult.Success || (noMICResult.IsLoginFailed && !noMICResult.IsUntrustedDomain) {
-			c.logVerbose("  MIC bypass diagnostic: SUCCESS - MIC computation is the root cause")
-		} else {
-			c.logVerbose("  MIC bypass diagnostic: STILL FAILED - issue is NOT (only) the MIC")
-			c.logVerbose("  MIC bypass result: error=%q", noMICResult.ErrorMessage)
-		}
-	}
 
 	// Step 2: Test based on encryption setting (matching Python mssql.py flow)
 	if encFlag == encryptReq {
@@ -1427,15 +1352,9 @@ func (c *Client) CollectServerInfo(ctx context.Context) (*types.ServerInfo, erro
 		return nil, fmt.Errorf("failed to collect server properties: %w", err)
 	}
 
-	// Get computer SID for ObjectIdentifier (like PowerShell does)
-	if err := c.collectComputerSID(ctx, info); err != nil {
-		// Non-fatal - fall back to hostname-based identifier
-		fmt.Printf("Warning: failed to get computer SID, using hostname: %v\n", err)
-		info.ObjectIdentifier = fmt.Sprintf("%s:%d", strings.ToLower(info.ServerName), info.Port)
-	} else {
-		// Use SID-based ObjectIdentifier like PowerShell
-		info.ObjectIdentifier = fmt.Sprintf("%s:%d", info.ComputerSID, info.Port)
-	}
+	// Set initial ObjectIdentifier using hostname; the collector will resolve
+	// the computer SID via LDAP and update this to a SID-based identifier.
+	info.ObjectIdentifier = fmt.Sprintf("%s:%d", strings.ToLower(info.ServerName), info.Port)
 
 	// Set SQLServerName for display purposes (FQDN:Port format)
 	info.SQLServerName = fmt.Sprintf("%s:%d", info.FQDN, info.Port)
@@ -1611,119 +1530,6 @@ func (c *Client) collectServerProperties(ctx context.Context, info *types.Server
 		info.FQDN = strings.TrimSuffix(fqdn[0], ".")
 	} else {
 		info.FQDN = info.Hostname
-	}
-
-	return nil
-}
-
-// collectComputerSID gets the computer account's SID from Active Directory
-// This is used to generate ObjectIdentifiers that match PowerShell's format
-func (c *Client) collectComputerSID(ctx context.Context, info *types.ServerInfo) error {
-	// Method 1: Try to get the computer SID by querying for logins that match the computer account
-	// The computer account login will have a SID like S-1-5-21-xxx-xxx-xxx-xxx
-	query := `
-		SELECT TOP 1
-			CONVERT(VARCHAR(85), sid, 1) AS sid
-		FROM sys.server_principals
-		WHERE type_desc = 'WINDOWS_LOGIN'
-		AND name LIKE '%$'
-		AND name LIKE '%' + CAST(SERVERPROPERTY('MachineName') AS VARCHAR(128)) + '$'
-	`
-
-	var computerSID sql.NullString
-	err := c.DBW().QueryRowContext(ctx, query).Scan(&computerSID)
-	if err == nil && computerSID.Valid && computerSID.String != "" {
-		// Convert hex SID to string format
-		sidStr := convertHexSIDToString(computerSID.String)
-		if sidStr != "" {
-			info.ComputerSID = sidStr
-			c.logVerbose("Found computer SID from computer account login: %s", sidStr)
-			return nil
-		}
-	}
-
-	// Method 2: Try to find any computer account login (ends with $)
-	query = `
-		SELECT TOP 1
-			CONVERT(VARCHAR(85), sid, 1) AS sid,
-			name
-		FROM sys.server_principals
-		WHERE type_desc = 'WINDOWS_LOGIN'
-		AND name LIKE '%$'
-		AND sid IS NOT NULL
-		AND LEN(CONVERT(VARCHAR(85), sid, 1)) > 10
-		ORDER BY principal_id
-	`
-
-	var sid, name sql.NullString
-	err = c.DBW().QueryRowContext(ctx, query).Scan(&sid, &name)
-	if err == nil && sid.Valid && sid.String != "" {
-		sidStr := convertHexSIDToString(sid.String)
-		if sidStr != "" && strings.HasPrefix(sidStr, "S-1-5-21-") {
-			// This is a domain computer account - extract domain SID and try to construct our computer SID
-			sidParts := strings.Split(sidStr, "-")
-			if len(sidParts) >= 8 {
-				// Domain SID is S-1-5-21-X-Y-Z (first 7 parts)
-				info.DomainSID = strings.Join(sidParts[:7], "-")
-				c.logVerbose("Found domain SID from computer account: %s", info.DomainSID)
-			}
-		}
-	}
-
-	// Method 3: Extract domain SID from any Windows login/group and use LDAP later for computer SID
-	if info.DomainSID == "" {
-		query = `
-			SELECT TOP 1
-				CONVERT(VARCHAR(85), sid, 1) AS sid,
-				name
-			FROM sys.server_principals
-			WHERE type_desc IN ('WINDOWS_LOGIN', 'WINDOWS_GROUP')
-			AND sid IS NOT NULL
-			AND LEN(CONVERT(VARCHAR(85), sid, 1)) > 10
-			ORDER BY principal_id
-		`
-
-		rows, err := c.DBW().QueryContext(ctx, query)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var sid, name sql.NullString
-				if err := rows.Scan(&sid, &name); err != nil {
-					continue
-				}
-
-				if sid.Valid && sid.String != "" {
-					sidStr := convertHexSIDToString(sid.String)
-					if sidStr == "" || !strings.HasPrefix(sidStr, "S-1-5-21-") {
-						continue
-					}
-
-					// If it's a computer account (ends with $), use its SID directly
-					if strings.HasSuffix(name.String, "$") {
-						info.ComputerSID = sidStr
-						c.logVerbose("Found computer SID from alternate computer login: %s", sidStr)
-						return nil
-					}
-
-					// Extract domain SID from this principal
-					sidParts := strings.Split(sidStr, "-")
-					if len(sidParts) >= 8 {
-						info.DomainSID = strings.Join(sidParts[:7], "-")
-						c.logVerbose("Found domain SID from Windows principal %s: %s", name.String, info.DomainSID)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// If we have a domain SID, the collector will try to resolve the computer SID via LDAP
-	// For now, return an error so the caller knows to try LDAP resolution
-	if info.ComputerSID == "" {
-		if info.DomainSID != "" {
-			return fmt.Errorf("could not determine computer SID from SQL Server, will try LDAP (domain SID: %s)", info.DomainSID)
-		}
-		return fmt.Errorf("could not determine computer SID")
 	}
 
 	return nil

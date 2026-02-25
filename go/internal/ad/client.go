@@ -112,6 +112,10 @@ func (c *Client) connectWithExplicitCredentials(dc, serverName string) error {
 			return nil
 		} else {
 			errors = append(errors, fmt.Sprintf("LDAPS:636 NTLM: %v", bindErr))
+			if isLDAPAuthError(bindErr) {
+				conn.Close()
+				return fmt.Errorf("LDAP authentication failed (invalid credentials): %s", strings.Join(errors, "; "))
+			}
 		}
 
 		// Try Simple Bind (works well over TLS)
@@ -121,6 +125,10 @@ func (c *Client) connectWithExplicitCredentials(dc, serverName string) error {
 			return nil
 		} else {
 			errors = append(errors, fmt.Sprintf("LDAPS:636 SimpleBind: %v", bindErr))
+			if isLDAPAuthError(bindErr) {
+				conn.Close()
+				return fmt.Errorf("LDAP authentication failed (invalid credentials): %s", strings.Join(errors, "; "))
+			}
 		}
 
 		// Try GSSAPI
@@ -149,6 +157,10 @@ func (c *Client) connectWithExplicitCredentials(dc, serverName string) error {
 				return nil
 			} else {
 				errors = append(errors, fmt.Sprintf("LDAP:389+StartTLS NTLM: %v", bindErr))
+				if isLDAPAuthError(bindErr) {
+					conn.Close()
+					return fmt.Errorf("LDAP authentication failed (invalid credentials): %s", strings.Join(errors, "; "))
+				}
 			}
 
 			// Try Simple Bind
@@ -158,6 +170,10 @@ func (c *Client) connectWithExplicitCredentials(dc, serverName string) error {
 				return nil
 			} else {
 				errors = append(errors, fmt.Sprintf("LDAP:389+StartTLS SimpleBind: %v", bindErr))
+				if isLDAPAuthError(bindErr) {
+					conn.Close()
+					return fmt.Errorf("LDAP authentication failed (invalid credentials): %s", strings.Join(errors, "; "))
+				}
 			}
 
 			// Try GSSAPI
@@ -272,6 +288,18 @@ func (c *Client) connectWithCurrentUser(dc, serverName string) error {
 	}
 
 	return fmt.Errorf("%s", errMsg)
+}
+
+// isLDAPAuthError checks if a bind error indicates invalid credentials (LDAP
+// Result Code 49). Continuing to try other bind methods with the same bad
+// credentials would count toward AD account lockout.
+func isLDAPAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "Invalid Credentials") ||
+		strings.Contains(errStr, "Result Code 49")
 }
 
 // containsAny checks if any of the error strings contain any of the substrings

@@ -23,9 +23,10 @@ const epaAuthProviderName = "epa-ntlm"
 // It creates authenticators that use our custom ntlmAuth implementation which
 // supports MsvAvChannelBindings and MsvAvTargetName AV_PAIRs in the NTLM Type3 message.
 type epaAuthProvider struct {
-	mu  sync.Mutex
-	cbt []byte  // Channel binding token (16-byte MD5 of SEC_CHANNEL_BINDINGS)
-	spn string  // Service Principal Name (MSSQLSvc/hostname:port)
+	mu      sync.Mutex
+	cbt     []byte // Channel binding token (16-byte MD5 of SEC_CHANNEL_BINDINGS)
+	spn     string // Service Principal Name (MSSQLSvc/hostname:port)
+	verbose bool
 }
 
 // SetCBT stores the channel binding hash for the next authentication.
@@ -61,8 +62,10 @@ func (p *epaAuthProvider) GetIntegratedAuthenticator(config msdsn.Config) (integ
 	spn := p.spn
 	p.mu.Unlock()
 
-	fmt.Printf("    [EPA-auth] GetIntegratedAuthenticator: domain=%s, user=%s, spn=%s, cbt=%x (%d bytes)\n",
-		domain, username, spn, cbt, len(cbt))
+	if p.verbose {
+		fmt.Printf("    [EPA-auth] GetIntegratedAuthenticator: domain=%s, user=%s, spn=%s, cbt=%x (%d bytes)\n",
+			domain, username, spn, cbt, len(cbt))
+	}
 
 	auth := newNTLMAuth(domain, username, config.Password, spn)
 	auth.SetEPATestMode(EPATestNormal)

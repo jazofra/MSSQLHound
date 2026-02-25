@@ -28,16 +28,16 @@ import (
 // Config holds the collector configuration
 type Config struct {
 	// Connection options
-	ServerInstance   string
-	ServerListFile   string
-	ServerList       string
-	UserID           string
-	Password         string
-	Domain string
-	DCIP   string // Domain controller hostname or IP address
-	DNSResolver      string // DNS resolver to use for lookups
-	LDAPUser         string
-	LDAPPassword     string
+	ServerInstance string
+	ServerListFile string
+	ServerList     string
+	UserID         string
+	Password       string
+	Domain         string
+	DCIP           string // Domain controller hostname or IP address
+	DNSResolver    string // DNS resolver to use for lookups
+	LDAPUser       string
+	LDAPPassword   string
 
 	// Output options
 	OutputFormat  string
@@ -82,6 +82,8 @@ type Collector struct {
 	serverSPNDataMu            sync.RWMutex              // Protects serverSPNData
 	skippedChangePasswordEdges map[string]bool           // Track unique skipped ChangePassword edges for CVE-2025-49758
 	skippedChangePasswordMu    sync.Mutex                // Protects skippedChangePasswordEdges
+	ldapAuthFailed             bool                      // Set when LDAP auth fails with invalid credentials to prevent lockout
+	ldapAuthFailedMu           sync.RWMutex              // Protects ldapAuthFailed
 }
 
 // ServerToProcess holds information about a server to be processed
@@ -125,12 +127,38 @@ func (c *Collector) getDNSResolver() string {
 }
 
 // newADClient creates a new AD client with proxy settings if configured.
+// Returns nil if a previous LDAP attempt already failed with invalid credentials
+// to prevent further authentication attempts that could lock out the AD account.
 func (c *Collector) newADClient(domain string) *ad.Client {
+	c.ldapAuthFailedMu.RLock()
+	failed := c.ldapAuthFailed
+	c.ldapAuthFailedMu.RUnlock()
+	if failed {
+		return nil
+	}
 	adClient := ad.NewClient(domain, c.config.DCIP, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
 	if c.proxyDialer != nil {
 		adClient.SetProxyDialer(c.proxyDialer)
 	}
 	return adClient
+}
+
+// setLDAPAuthFailed marks LDAP authentication as failed to prevent further attempts.
+func (c *Collector) setLDAPAuthFailed() {
+	c.ldapAuthFailedMu.Lock()
+	c.ldapAuthFailed = true
+	c.ldapAuthFailedMu.Unlock()
+}
+
+// isLDAPAuthError checks if an error indicates invalid LDAP credentials.
+func isLDAPAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "Invalid Credentials") ||
+		strings.Contains(errStr, "invalid credentials") ||
+		strings.Contains(errStr, "Result Code 49")
 }
 
 // newMSSQLClient creates a new MSSQL client with proxy settings if configured.
@@ -504,9 +532,16 @@ func (c *Collector) tryResolveSID(server *ServerToProcess) {
 
 	// Try LDAP
 	adClient := c.newADClient(c.config.Domain)
+	if adClient == nil {
+		return
+	}
 	defer adClient.Close()
 
 	sid, err := adClient.ResolveComputerSID(server.Hostname)
+	if err != nil && isLDAPAuthError(err) {
+		c.setLDAPAuthFailed()
+		return
+	}
 	if err == nil && sid != "" {
 		server.ComputerSID = sid
 	}
@@ -562,9 +597,17 @@ func (c *Collector) detectDomain() string {
 func (c *Collector) enumerateServersFromAD() error {
 	// First try native Go LDAP
 	adClient := c.newADClient(c.config.Domain)
+	if adClient == nil {
+		return fmt.Errorf("LDAP authentication previously failed, skipping AD enumeration")
+	}
 
 	spns, err := adClient.EnumerateMSSQLSPNs()
 	adClient.Close()
+
+	if err != nil && isLDAPAuthError(err) {
+		c.setLDAPAuthFailed()
+		return fmt.Errorf("LDAP authentication failed: %w", err)
+	}
 
 	// If LDAP failed on Windows, try using PowerShell/ADSI as fallback
 	if err != nil && runtime.GOOS == "windows" {
@@ -633,9 +676,18 @@ func (c *Collector) enumerateServersFromAD() error {
 	if c.config.ScanAllComputers {
 		fmt.Println("ScanAllComputers enabled, enumerating all domain computers...")
 		adClient := c.newADClient(c.config.Domain)
+		if adClient == nil {
+			fmt.Println("  Skipping: LDAP authentication previously failed")
+			return nil
+		}
 		defer adClient.Close()
 
 		computers, err := adClient.EnumerateAllComputers()
+		if err != nil && isLDAPAuthError(err) {
+			c.setLDAPAuthFailed()
+			fmt.Printf("  LDAP authentication failed: %v\n", err)
+			return nil
+		}
 		if err != nil && runtime.GOOS == "windows" {
 			// Try PowerShell fallback on Windows
 			fmt.Printf("LDAP enumeration failed (%v), trying PowerShell fallback...\n", err)
@@ -815,6 +867,12 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 	}
 
 	if err := client.Connect(ctx); err != nil {
+		// If SQL auth failed and the same credentials are used for LDAP, mark LDAP
+		// as failed too to prevent redundant auth attempts that could lock out the account.
+		if mssql.IsAuthError(err) && c.config.UserID == c.config.LDAPUser {
+			c.setLDAPAuthFailed()
+		}
+
 		// If hostname doesn't have a domain but we have one from linked server discovery, try FQDN
 		if server.Domain != "" && !strings.Contains(server.Hostname, ".") {
 			fqdnHostname := server.Hostname + "." + server.Domain
@@ -1053,12 +1111,21 @@ func (c *Collector) lookupSPNsForServer(server *ServerToProcess) *ServerSPNInfo 
 		return nil
 	}
 
-	fmt.Printf("  Looking up SPNs for %s in AD (domain: %s)\n", server.Hostname, domain)
-
 	// Try native LDAP first
 	adClient := c.newADClient(domain)
+	if adClient == nil {
+		return nil
+	}
+
+	fmt.Printf("  Looking up SPNs for %s in AD (domain: %s)\n", server.Hostname, domain)
 	spns, err := adClient.LookupMSSQLSPNsForHost(server.Hostname)
 	adClient.Close()
+
+	if err != nil && isLDAPAuthError(err) {
+		c.setLDAPAuthFailed()
+		fmt.Printf("  AD SPN lookup failed (invalid credentials): %v\n", err)
+		return nil
+	}
 
 	// If LDAP failed on Windows, try PowerShell/ADSI
 	if err != nil && runtime.GOOS == "windows" {
@@ -1265,10 +1332,16 @@ func (c *Collector) resolveComputerSIDViaLDAP(serverInfo *types.ServerInfo) {
 
 	// Create AD client
 	adClient := c.newADClient(domain)
+	if adClient == nil {
+		return
+	}
 	defer adClient.Close()
 
 	sid, err = adClient.ResolveComputerSID(machineName)
 	if err != nil {
+		if isLDAPAuthError(err) {
+			c.setLDAPAuthFailed()
+		}
 		fmt.Printf("  Note: Could not resolve computer SID via LDAP: %v\n", err)
 		return
 	}
@@ -1470,8 +1543,15 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 			// For other computer accounts, try LDAP
 			if c.config.Domain != "" {
 				adClient := c.newADClient(c.config.Domain)
+				if adClient == nil {
+					continue
+				}
 				principal, err := adClient.ResolveSID(sa.SID)
 				adClient.Close()
+				if err != nil && isLDAPAuthError(err) {
+					c.setLDAPAuthFailed()
+					continue
+				}
 				if err == nil && principal != nil && principal.ObjectClass == "computer" {
 					// Use the resolved name (which is DNSHostName for computers in our updated AD client)
 					oldName := sa.Name
@@ -1493,8 +1573,15 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 
 			// Create AD client
 			adClient := c.newADClient(c.config.Domain)
+			if adClient == nil {
+				continue
+			}
 			principal, err := adClient.ResolveName(sa.Name)
 			adClient.Close()
+			if err != nil && isLDAPAuthError(err) {
+				c.setLDAPAuthFailed()
+				continue
+			}
 			if err != nil {
 				fmt.Printf("  Note: Could not resolve service account %s via LDAP: %v\n", sa.Name, err)
 				continue
@@ -1527,8 +1614,15 @@ func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo) {
 			return nil
 		}
 		adClient := c.newADClient(c.config.Domain)
+		if adClient == nil {
+			return nil
+		}
 		principal, err := adClient.ResolveName(identity)
 		adClient.Close()
+		if err != nil && isLDAPAuthError(err) {
+			c.setLDAPAuthFailed()
+			return nil
+		}
 		if err != nil || principal == nil || principal.SID == "" {
 			return nil
 		}
@@ -1648,10 +1742,14 @@ func (c *Collector) enumerateLocalGroupMembers(serverInfo *types.ServerInfo) {
 			// Fall back to LDAP if Windows API didn't work and we have a domain
 			if lm.SID == "" && c.config.Domain != "" {
 				adClient := c.newADClient(c.config.Domain)
-				resolved, err := adClient.ResolveName(fullName)
-				adClient.Close()
-				if err == nil && resolved.SID != "" {
-					lm.SID = resolved.SID
+				if adClient != nil {
+					resolved, err := adClient.ResolveName(fullName)
+					adClient.Close()
+					if err != nil && isLDAPAuthError(err) {
+						c.setLDAPAuthFailed()
+					} else if err == nil && resolved.SID != "" {
+						lm.SID = resolved.SID
+					}
 				}
 			}
 
@@ -2177,22 +2275,28 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 	resolvedPrincipals := make(map[string]*types.DomainPrincipal)
 	if c.config.Domain != "" {
 		adClient := c.newADClient(c.config.Domain)
-		for _, principal := range serverInfo.ServerPrincipals {
-			if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
-				continue
+		if adClient != nil {
+			for _, principal := range serverInfo.ServerPrincipals {
+				if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
+					continue
+				}
+				if !strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") {
+					continue
+				}
+				if _, already := resolvedPrincipals[principal.SecurityIdentifier]; already {
+					continue
+				}
+				resolved, err := adClient.ResolveSID(principal.SecurityIdentifier)
+				if err != nil && isLDAPAuthError(err) {
+					c.setLDAPAuthFailed()
+					break
+				}
+				if err == nil && resolved != nil {
+					resolvedPrincipals[principal.SecurityIdentifier] = resolved
+				}
 			}
-			if !strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") {
-				continue
-			}
-			if _, already := resolvedPrincipals[principal.SecurityIdentifier]; already {
-				continue
-			}
-			resolved, err := adClient.ResolveSID(principal.SecurityIdentifier)
-			if err == nil && resolved != nil {
-				resolvedPrincipals[principal.SecurityIdentifier] = resolved
-			}
+			adClient.Close()
 		}
-		adClient.Close()
 	}
 
 	// Create nodes for domain principals with SQL logins
@@ -3053,13 +3157,13 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				principal.ObjectIdentifier,
 				bloodhound.EdgeKinds.CoerceAndRelayTo,
 				&bloodhound.EdgeContext{
-					SourceName:           "AUTHENTICATED USERS",
-					SourceType:           "Group",
-					TargetName:           principal.Name,
-					TargetType:           bloodhound.NodeKinds.Login,
-					SQLServerName:        serverInfo.SQLServerName,
-					SQLServerID:          serverInfo.ObjectIdentifier,
-					SecurityIdentifier:   principal.SecurityIdentifier,
+					SourceName:         "AUTHENTICATED USERS",
+					SourceType:         "Group",
+					TargetName:         principal.Name,
+					TargetType:         bloodhound.NodeKinds.Login,
+					SQLServerName:      serverInfo.SQLServerName,
+					SQLServerID:        serverInfo.ObjectIdentifier,
+					SecurityIdentifier: principal.SecurityIdentifier,
 				},
 			)
 			if err := writer.WriteEdge(edge); err != nil {
@@ -3519,15 +3623,15 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				proxyTargetID,
 				bloodhound.EdgeKinds.HasProxyCred,
 				&bloodhound.EdgeContext{
-					SourceName:           loginName,
-					SourceType:           bloodhound.NodeKinds.Login,
-					TargetName:           proxy.CredentialIdentity,
-					TargetType:           "Base",
-					SQLServerName:        serverInfo.SQLServerName,
-					SQLServerID:          serverInfo.ObjectIdentifier,
-					CredentialIdentity:   proxy.CredentialIdentity,
-					IsEnabled:            proxy.Enabled,
-					ProxyName:            proxy.Name,
+					SourceName:         loginName,
+					SourceType:         bloodhound.NodeKinds.Login,
+					TargetName:         proxy.CredentialIdentity,
+					TargetType:         "Base",
+					SQLServerName:      serverInfo.SQLServerName,
+					SQLServerID:        serverInfo.ObjectIdentifier,
+					CredentialIdentity: proxy.CredentialIdentity,
+					IsEnabled:          proxy.Enabled,
+					ProxyName:          proxy.Name,
 				},
 			)
 			if edge != nil {
@@ -3543,10 +3647,10 @@ func (c *Collector) createEdges(writer *bloodhound.StreamingWriter, serverInfo *
 				edge.Properties["subsystems"] = strings.Join(proxy.Subsystems, ", ")
 				if proxy.ResolvedPrincipal != nil {
 					resolvedType := proxy.ResolvedPrincipal.ObjectClass
-				if len(resolvedType) > 0 {
-					resolvedType = strings.ToUpper(resolvedType[:1]) + resolvedType[1:]
-				}
-				edge.Properties["resolvedType"] = resolvedType
+					if len(resolvedType) > 0 {
+						resolvedType = strings.ToUpper(resolvedType[:1]) + resolvedType[1:]
+					}
+					edge.Properties["resolvedType"] = resolvedType
 				}
 			}
 			if err := writer.WriteEdge(edge); err != nil {
@@ -4030,14 +4134,18 @@ func (c *Collector) resolveDataSourceToSID(hostname, port, instanceName, domain 
 	// Try LDAP if domain is specified and Windows API failed
 	if domain != "" {
 		adClient := c.newADClient(domain)
-		defer adClient.Close()
+		if adClient != nil {
+			defer adClient.Close()
 
-		sid, err = adClient.ResolveComputerSID(machineName)
-		if err == nil && sid != "" {
-			if instanceName != "" {
-				return fmt.Sprintf("%s:%s", sid, instanceName)
+			sid, err = adClient.ResolveComputerSID(machineName)
+			if err != nil && isLDAPAuthError(err) {
+				c.setLDAPAuthFailed()
+			} else if err == nil && sid != "" {
+				if instanceName != "" {
+					return fmt.Sprintf("%s:%s", sid, instanceName)
+				}
+				return fmt.Sprintf("%s:%s", sid, port)
 			}
-			return fmt.Sprintf("%s:%s", sid, port)
 		}
 	}
 
@@ -4213,14 +4321,14 @@ func (c *Collector) createFixedRoleEdges(writer *bloodhound.StreamingWriter, ser
 						targetPrincipal.ObjectIdentifier,
 						bloodhound.EdgeKinds.ChangePassword,
 						&bloodhound.EdgeContext{
-							SourceName:             principal.Name,
-							SourceType:             bloodhound.NodeKinds.ServerRole,
-							TargetName:             targetPrincipal.Name,
-							TargetType:             bloodhound.NodeKinds.Login,
-							TargetTypeDescription:  targetPrincipal.TypeDescription,
-							SQLServerName:          serverInfo.SQLServerName,
-							SQLServerID:            serverInfo.ObjectIdentifier,
-							Permission:             "ALTER ANY LOGIN",
+							SourceName:            principal.Name,
+							SourceType:            bloodhound.NodeKinds.ServerRole,
+							TargetName:            targetPrincipal.Name,
+							TargetType:            bloodhound.NodeKinds.Login,
+							TargetTypeDescription: targetPrincipal.TypeDescription,
+							SQLServerName:         serverInfo.SQLServerName,
+							SQLServerID:           serverInfo.ObjectIdentifier,
+							Permission:            "ALTER ANY LOGIN",
 						},
 					)
 					if err := writer.WriteEdge(edge); err != nil {
