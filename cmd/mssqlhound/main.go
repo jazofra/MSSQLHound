@@ -60,8 +60,7 @@ func main() {
 		Short: "MSSQLHound: Collector for adding MSSQL attack paths to BloodHound",
 		Long: `MSSQLHound: Collector for adding MSSQL attack paths to BloodHound with OpenGraph
 
-Author: Chris Thompson (@_Mayyhem) at SpecterOps
-Go port: Javier Azofra at Siemens Healthineers
+Authors: Chris Thompson (@_Mayyhem) at SpecterOps and Javier Azofra at Siemens Healthineers
 
 Collects BloodHound OpenGraph compatible data from one or more MSSQL servers into individual files, then zips them.`,
 		Version: version,

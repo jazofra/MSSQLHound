@@ -84,6 +84,7 @@ type Collector struct {
 	skippedChangePasswordMu    sync.Mutex                // Protects skippedChangePasswordEdges
 	ldapAuthFailed             bool                      // Set when LDAP auth fails with invalid credentials to prevent lockout
 	ldapAuthFailedMu           sync.RWMutex              // Protects ldapAuthFailed
+	spnEnumerationDone         bool                      // true after initial broad SPN sweep completed
 }
 
 // ServerToProcess holds information about a server to be processed
@@ -711,6 +712,7 @@ func (c *Collector) enumerateServersFromAD() error {
 	}
 
 	fmt.Printf("\nUnique servers to process: %d\n", len(c.serversToProcess))
+	c.spnEnumerationDone = true
 	return nil
 }
 
@@ -855,6 +857,19 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 	client.SetLDAPCredentials(c.config.LDAPUser, c.config.LDAPPassword)
 	client.SetVerbose(c.config.Verbose)
 	client.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
+
+	// Quick port check before attempting EPA or authentication
+	if err := client.CheckPort(ctx); err != nil {
+		fmt.Printf("  Port not reachable, skipping: %v\n", err)
+		if spnInfo != nil {
+			return c.processServerFromSPNData(server, spnInfo, nil, err)
+		}
+		spnInfo = c.lookupSPNsForServer(server)
+		if spnInfo != nil {
+			return c.processServerFromSPNData(server, spnInfo, nil, err)
+		}
+		return fmt.Errorf("port not reachable: %w", err)
+	}
 
 	// Run EPA checks before attempting SQL authentication
 	var epaResult *mssql.EPATestResult
@@ -1144,6 +1159,11 @@ func (c *Collector) lookupSPNsForServer(server *ServerToProcess) *ServerSPNInfo 
 
 	if domain == "" {
 		fmt.Println("  Cannot lookup SPN - no domain available")
+		return nil
+	}
+
+	// If we already did a full SPN sweep for the same domain, a per-host lookup won't find anything new
+	if c.spnEnumerationDone && strings.EqualFold(domain, c.config.Domain) {
 		return nil
 	}
 

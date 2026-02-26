@@ -412,6 +412,46 @@ func (c *Client) Connect(ctx context.Context) error {
 	return err
 }
 
+// CheckPort performs a quick TCP connectivity check against the SQL Server port.
+// Call this before EPA testing or authentication to skip unreachable servers fast.
+func (c *Client) CheckPort(ctx context.Context) error {
+	port := c.port
+	if port == 0 && c.instanceName != "" {
+		resolvedPort, err := c.resolveInstancePort(ctx)
+		if err != nil {
+			return fmt.Errorf("port check: failed to resolve instance port: %w", err)
+		}
+		port = resolvedPort
+		c.port = resolvedPort // cache for later EPA/Connect calls
+	}
+	if port == 0 {
+		port = 1433
+	}
+
+	addr := fmt.Sprintf("%s:%d", c.hostname, port)
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer dialCancel()
+
+	var conn net.Conn
+	var err error
+	if c.proxyDialer != nil {
+		dialAddr, resolveErr := resolveForProxy(dialCtx, c.hostname, port)
+		if resolveErr != nil {
+			dialAddr = addr
+		}
+		conn, err = c.proxyDialer.DialContext(dialCtx, "tcp", dialAddr)
+	} else {
+		var dialer net.Dialer
+		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
+	}
+	if err != nil {
+		return fmt.Errorf("port %d not reachable on %s: %w", port, c.hostname, err)
+	}
+	conn.Close()
+	return nil
+}
+
 // connectNative tries to connect using go-mssqldb
 func (c *Client) connectNative(ctx context.Context) error {
 	// Connection strategies to try in order
