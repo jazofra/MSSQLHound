@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -537,8 +538,7 @@ func (c *Client) connectNative(ctx context.Context) error {
 		}
 		connStr := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;encrypt=disable;TrustServerCertificate=true;app name=MSSQLHound",
 			c.hostname, port, c.userID, c.password)
-		c.logVerbose("Trying connection strategy 'EPA+strict-TLS': %s",
-			strings.Replace(connStr, c.password, "****", 1))
+		c.logVerbose("Trying connection strategy 'EPA+strict-TLS': %s", redactConnStr(connStr))
 
 		config, parseErr := msdsn.Parse(connStr)
 		if parseErr == nil {
@@ -588,8 +588,7 @@ func (c *Client) connectNative(ctx context.Context) error {
 		}
 		connStr := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;encrypt=disable;TrustServerCertificate=true;app name=MSSQLHound",
 			c.hostname, port, c.userID, c.password)
-		c.logVerbose("Trying connection strategy 'EPA+TDS-TLS': %s",
-			strings.Replace(connStr, c.password, "****", 1))
+		c.logVerbose("Trying connection strategy 'EPA+TDS-TLS': %s", redactConnStr(connStr))
 
 		config, parseErr := msdsn.Parse(connStr)
 		if parseErr == nil {
@@ -623,7 +622,7 @@ func (c *Client) connectNative(ctx context.Context) error {
 	var lastErr error
 	for _, strategy := range strategies {
 		connStr := c.buildConnectionStringForStrategy(strategy.serverName, strategy.encrypt, strategy.useServerSPN, strategy.spnHost, strategy.certHostname)
-		c.logVerbose("Trying connection strategy '%s': %s", strategy.name, connStr)
+		c.logVerbose("Trying connection strategy '%s': %s", strategy.name, redactConnStr(connStr))
 
 		// Parse connection string into config and use NewConnectorConfig for all
 		// strategies so we can inject a custom proxy dialer when configured.
@@ -805,6 +804,14 @@ func (c *Client) DB() *sql.DB {
 // Use this for query methods to ensure compatibility with PowerShell fallback
 func (c *Client) DBW() *DBWrapper {
 	return NewDBWrapper(c.db, c.psClient, c.usePowerShell)
+}
+
+// connStrPasswordRe matches the password field in a semicolon-delimited connection string.
+var connStrPasswordRe = regexp.MustCompile(`(?i)(password=)[^;]*`)
+
+// redactConnStr replaces the password field value in a connection string with "****".
+func redactConnStr(connStr string) string {
+	return connStrPasswordRe.ReplaceAllString(connStr, "${1}****")
 }
 
 // buildConnectionStringForStrategy creates the connection string for a specific strategy
