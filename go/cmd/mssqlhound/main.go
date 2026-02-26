@@ -17,16 +17,16 @@ var (
 	version = "1.1.0"
 
 	// Connection options
-	serverInstance   string
-	serverListFile   string
-	serverList       string
-	userID           string
-	password         string
-	domain string
-	dcIP   string
-	dnsResolver      string
-	ldapUser         string
-	ldapPassword     string
+	serverInstance string
+	serverListFile string
+	serverList     string
+	userID         string
+	password       string
+	domain         string
+	dcIP           string
+	dnsResolver    string
+	ldapUser       string
+	ldapPassword   string
 
 	// Output options
 	outputFormat  string
@@ -63,8 +63,7 @@ func main() {
 		Short: "MSSQLHound: Collector for adding MSSQL attack paths to BloodHound",
 		Long: `MSSQLHound: Collector for adding MSSQL attack paths to BloodHound with OpenGraph
 
-Author: Chris Thompson (@_Mayyhem) at SpecterOps
-Go port: Javier Azofra at Siemens Healthineers
+Authors: Chris Thompson (@_Mayyhem) at SpecterOps and Javier Azofra at Siemens Healthineers
 
 Collects BloodHound OpenGraph compatible data from one or more MSSQL servers into individual files, then zips them.`,
 		Version: version,
@@ -119,8 +118,7 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 
 func run(cmd *cobra.Command, args []string) error {
 	fmt.Printf("MSSQLHound v%s\n", version)
-	fmt.Println("Author: Chris Thompson (@_Mayyhem) at SpecterOps")
-	fmt.Println("Go port: Javier Azofra at Siemens Healthineers")
+	fmt.Println("Authors: Chris Thompson (@_Mayyhem) at SpecterOps and Javier Azofra at Siemens Healthineers")
 	fmt.Println()
 
 	// Configure custom DNS resolver if specified
