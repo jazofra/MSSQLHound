@@ -857,10 +857,13 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 	client.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
 
 	// Run EPA checks before attempting SQL authentication
+	var epaResult *mssql.EPATestResult
 	if c.config.LDAPUser != "" && c.config.LDAPPassword != "" {
-		epaResult, err := client.TestEPA(ctx)
-		if err != nil {
-			c.logVerbose("EPA pre-check failed for %s: %v", server.ConnectionString, err)
+		var epaErr error
+		epaResult, epaErr = client.TestEPA(ctx)
+		if epaErr != nil {
+			c.logVerbose("EPA pre-check failed for %s: %v", server.ConnectionString, epaErr)
+			epaResult = nil
 		} else {
 			client.SetEPAResult(epaResult)
 		}
@@ -894,11 +897,12 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 
 			// Run EPA checks before attempting SQL authentication on FQDN client
 			if c.config.LDAPUser != "" && c.config.LDAPPassword != "" {
-				epaResult, epaErr := fqdnClient.TestEPA(ctx)
+				fqdnEPAResult, epaErr := fqdnClient.TestEPA(ctx)
 				if epaErr != nil {
 					c.logVerbose("EPA pre-check failed for %s: %v", fqdnConnStr, epaErr)
 				} else {
-					fqdnClient.SetEPAResult(epaResult)
+					fqdnClient.SetEPAResult(fqdnEPAResult)
+					epaResult = fqdnEPAResult // Use FQDN EPA result as the canonical result
 				}
 			}
 
@@ -919,18 +923,24 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 		// Connection failed - check if we have SPN data to create partial output
 		if spnInfo != nil {
 			fmt.Printf("  Connection failed but server has SPN - creating nodes/edges from SPN data\n")
-			return c.processServerFromSPNData(server, spnInfo, err)
+			return c.processServerFromSPNData(server, spnInfo, epaResult, err)
 		}
 
 		// No SPN data available - try to look up SPNs from AD for this server
 		spnInfo = c.lookupSPNsForServer(server)
 		if spnInfo != nil {
 			fmt.Printf("  Connection failed - looked up SPN from AD, creating partial output\n")
-			return c.processServerFromSPNData(server, spnInfo, err)
+			return c.processServerFromSPNData(server, spnInfo, epaResult, err)
 		}
 
-		// No SPN data - skip this server
-		return fmt.Errorf("connection failed and no SPN data available: %w", err)
+		// No SPN data - check if we have EPA data to create a minimal node
+		if epaResult != nil {
+			fmt.Printf("  Connection failed - no SPN data but EPA data available, creating partial output\n")
+			return c.processServerFromSPNData(server, nil, epaResult, err)
+		}
+
+		// No SPN data and no EPA data - skip this server
+		return fmt.Errorf("connection failed and no SPN/EPA data available: %w", err)
 	}
 
 connected:
@@ -944,14 +954,20 @@ connected:
 		// Collection failed after connection - try partial output if we have SPN data
 		if spnInfo != nil {
 			fmt.Printf("  Collection failed but server has SPN - creating nodes/edges from SPN data\n")
-			return c.processServerFromSPNData(server, spnInfo, err)
+			return c.processServerFromSPNData(server, spnInfo, epaResult, err)
 		}
 
 		// Try AD lookup for SPN data
 		spnInfo = c.lookupSPNsForServer(server)
 		if spnInfo != nil {
 			fmt.Printf("  Collection failed - looked up SPN from AD, creating partial output\n")
-			return c.processServerFromSPNData(server, spnInfo, err)
+			return c.processServerFromSPNData(server, spnInfo, epaResult, err)
+		}
+
+		// No SPN data - check if we have EPA data to create a minimal node
+		if epaResult != nil {
+			fmt.Printf("  Collection failed - no SPN data but EPA data available, creating partial output\n")
+			return c.processServerFromSPNData(server, nil, epaResult, err)
 		}
 
 		return fmt.Errorf("collection failed: %w", err)
@@ -1013,8 +1029,9 @@ connected:
 	return nil
 }
 
-// processServerFromSPNData creates partial output when connection fails but SPN data exists
-func (c *Collector) processServerFromSPNData(server *ServerToProcess, spnInfo *ServerSPNInfo, connErr error) error {
+// processServerFromSPNData creates partial output when connection fails but SPN and/or EPA data exists.
+// spnInfo may be nil if only EPA data is available; epaResult may be nil if only SPN data is available.
+func (c *Collector) processServerFromSPNData(server *ServerToProcess, spnInfo *ServerSPNInfo, epaResult *mssql.EPATestResult, connErr error) error {
 	// Try to resolve the FQDN
 	fqdn := server.Hostname
 	if !strings.Contains(server.Hostname, ".") && c.config.Domain != "" {
@@ -1051,7 +1068,7 @@ func (c *Collector) processServerFromSPNData(server *ServerToProcess, spnInfo *S
 		}
 	}
 
-	// Create minimal server info from SPN data
+	// Create minimal server info from SPN and/or EPA data
 	// NOTE: We intentionally do NOT add ServiceAccounts here to match PowerShell behavior.
 	// PS stores ServiceAccountSIDs from SPN but uses ServiceAccounts (from SQL query) for edge creation.
 	// For failed connections, ServiceAccounts is empty, so no service account edges are created.
@@ -1064,14 +1081,33 @@ func (c *Collector) processServerFromSPNData(server *ServerToProcess, spnInfo *S
 		Port:             server.Port,
 		FQDN:             fqdn,
 		ComputerSID:      computerSID,
-		SPNs:             spnInfo.SPNs,
 		// ServiceAccounts intentionally left empty to match PS behavior
+	}
+
+	// Add SPN data if available
+	if spnInfo != nil {
+		serverInfo.SPNs = spnInfo.SPNs
+	}
+
+	// Add EPA data if available (encryption and extended protection settings)
+	if epaResult != nil {
+		if epaResult.ForceEncryption {
+			serverInfo.ForceEncryption = "Yes"
+		} else {
+			serverInfo.ForceEncryption = "No"
+		}
+		if epaResult.StrictEncryption {
+			serverInfo.StrictEncryption = "Yes"
+		} else {
+			serverInfo.StrictEncryption = "No"
+		}
+		serverInfo.ExtendedProtection = epaResult.EPAStatus
 	}
 
 	// Check CVE-2025-49758 patch status (will show version unknown for SPN-only data)
 	c.logCVE202549758Status(serverInfo)
 
-	fmt.Printf("Created partial output from SPN data (connection error: %v)\n", connErr)
+	fmt.Printf("Created partial output from SPN/EPA data (connection error: %v)\n", connErr)
 
 	// Generate output using the consistent filename generation
 	outputFile := filepath.Join(c.tempDir, c.generateFilename(server))
