@@ -86,6 +86,13 @@ type Collector struct {
 	ldapAuthFailed             bool                      // Set when LDAP auth fails with invalid credentials to prevent lockout
 	ldapAuthFailedMu           sync.RWMutex              // Protects ldapAuthFailed
 	spnEnumerationDone         bool                      // true after initial broad SPN sweep completed
+
+	// Accumulated AD nodes across all servers for separate file output
+	adComputers []*bloodhound.Node
+	adUsers     []*bloodhound.Node
+	adGroups    []*bloodhound.Node
+	adSeenNodes map[string]bool // Dedup AD nodes by ID across servers
+	adNodesMu   sync.Mutex      // Protects adComputers, adUsers, adGroups, adSeenNodes
 }
 
 // ServerToProcess holds information about a server to be processed
@@ -113,6 +120,7 @@ func New(config *Config) *Collector {
 	return &Collector{
 		config:        config,
 		serverSPNData: make(map[string]*ServerSPNInfo),
+		adSeenNodes:   make(map[string]bool),
 	}
 }
 
@@ -227,6 +235,13 @@ func (c *Collector) Run() error {
 	// Process linked servers recursively if enabled
 	if c.config.CollectFromLinkedServers {
 		c.processLinkedServersQueue(processedServers)
+	}
+
+	// Write accumulated AD nodes to separate files (computers.json, users.json, groups.json)
+	if !c.config.SkipADNodeCreation {
+		if err := c.writeADFiles(); err != nil {
+			return fmt.Errorf("failed to write AD files: %w", err)
+		}
 	}
 
 	// Create zip file
@@ -1100,7 +1115,6 @@ connected:
 	}
 
 	c.addOutputFile(outputFile)
-	fmt.Printf("Output: %s\n", outputFile)
 
 	return nil
 }
@@ -1193,7 +1207,6 @@ func (c *Collector) processServerFromSPNData(server *ServerToProcess, spnInfo *S
 	}
 
 	c.addOutputFile(outputFile)
-	fmt.Printf("Output: %s\n", outputFile)
 
 	return nil
 }
@@ -1976,9 +1989,10 @@ func (c *Collector) generateOutput(serverInfo *types.ServerInfo, outputFile stri
 		}
 	}
 
-	// Create AD nodes (User, Group, Computer) if not skipped
+	// Collect AD nodes (User, Group, Computer) if not skipped.
+	// These are accumulated across servers and written to separate files (computers.json, users.json, groups.json).
 	if !c.config.SkipADNodeCreation {
-		if err := c.createADNodes(writer, serverInfo); err != nil {
+		if err := c.createADNodes(serverInfo); err != nil {
 			return err
 		}
 	}
@@ -2008,7 +2022,7 @@ func (c *Collector) generateOutput(serverInfo *types.ServerInfo, outputFile stri
 	c.skippedChangePasswordMu.Unlock()
 
 	nodes, edges := writer.Stats()
-	fmt.Printf("Wrote %d nodes and %d edges\n", nodes, edges)
+	fmt.Printf("Wrote %d nodes and %d edges to %s\n", nodes, edges, filepath.Base(outputFile))
 
 	return nil
 }
@@ -2313,8 +2327,29 @@ func (c *Collector) createDatabasePrincipalNode(principal *types.DatabasePrincip
 }
 
 // createADNodes creates BloodHound nodes for Active Directory principals referenced by SQL logins
-func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo *types.ServerInfo) error {
+func (c *Collector) createADNodes(serverInfo *types.ServerInfo) error {
 	createdNodes := make(map[string]bool)
+
+	// addADNode adds a node to the appropriate collector-level AD list (deduplicated across servers)
+	addADNode := func(node *bloodhound.Node) {
+		c.adNodesMu.Lock()
+		defer c.adNodesMu.Unlock()
+
+		if c.adSeenNodes[node.ID] {
+			return
+		}
+		c.adSeenNodes[node.ID] = true
+
+		// Categorize by primary kind (first element)
+		switch node.Kinds[0] {
+		case bloodhound.NodeKinds.Computer:
+			c.adComputers = append(c.adComputers, node)
+		case bloodhound.NodeKinds.Group:
+			c.adGroups = append(c.adGroups, node)
+		default:
+			c.adUsers = append(c.adUsers, node)
+		}
+	}
 
 	// Create Computer node for the server's host computer (matching PowerShell behavior)
 	if serverInfo.ComputerSID != "" {
@@ -2343,9 +2378,7 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 				"SAMAccountName":    samAccountName,
 			},
 		}
-		if err := writer.WriteNode(node); err != nil {
-			return err
-		}
+		addADNode(node)
 		createdNodes[serverInfo.ComputerSID] = true
 	}
 
@@ -2380,9 +2413,7 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 					"name": "AUTHENTICATED USERS@" + c.config.Domain,
 				},
 			}
-			if err := writer.WriteNode(node); err != nil {
-				return err
-			}
+			addADNode(node)
 			createdNodes[authedUsersSID] = true
 		}
 	}
@@ -2502,9 +2533,7 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 			Kinds:      kinds,
 			Properties: nodeProps,
 		}
-		if err := writer.WriteNode(node); err != nil {
-			return err
-		}
+		addADNode(node)
 		createdNodes[principal.SecurityIdentifier] = true
 	}
 
@@ -2571,9 +2600,7 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 				"isActiveDirectoryPrincipal": principal.IsActiveDirectoryPrincipal,
 			},
 		}
-		if err := writer.WriteNode(node); err != nil {
-			return err
-		}
+		addADNode(node)
 		createdNodes[groupObjectID] = true
 	}
 
@@ -2637,9 +2664,7 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 			Kinds:      kinds,
 			Properties: nodeProps,
 		}
-		if err := writer.WriteNode(node); err != nil {
-			return err
-		}
+		addADNode(node)
 		createdNodes[saID] = true
 	}
 
@@ -2656,9 +2681,9 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 		}
 	}
 
-	writeCredentialNode := func(sid string, principal *types.DomainPrincipal) error {
+	addCredentialNode := func(sid string, principal *types.DomainPrincipal) {
 		if sid == "" || createdNodes[sid] {
-			return nil
+			return
 		}
 		kind := credentialNodeKind(principal.ObjectClass)
 		props := map[string]interface{}{
@@ -2683,19 +2708,14 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 			Kinds:      []string{kind, "Base"},
 			Properties: props,
 		}
-		if err := writer.WriteNode(node); err != nil {
-			return err
-		}
+		addADNode(node)
 		createdNodes[sid] = true
-		return nil
 	}
 
 	// Server-level credentials
 	for _, cred := range serverInfo.Credentials {
 		if cred.ResolvedPrincipal != nil {
-			if err := writeCredentialNode(cred.ResolvedSID, cred.ResolvedPrincipal); err != nil {
-				return err
-			}
+			addCredentialNode(cred.ResolvedSID, cred.ResolvedPrincipal)
 		}
 	}
 
@@ -2703,9 +2723,7 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 	for _, db := range serverInfo.Databases {
 		for _, cred := range db.DBScopedCredentials {
 			if cred.ResolvedPrincipal != nil {
-				if err := writeCredentialNode(cred.ResolvedSID, cred.ResolvedPrincipal); err != nil {
-					return err
-				}
+				addCredentialNode(cred.ResolvedSID, cred.ResolvedPrincipal)
 			}
 		}
 	}
@@ -2713,9 +2731,7 @@ func (c *Collector) createADNodes(writer *bloodhound.StreamingWriter, serverInfo
 	// Proxy account credentials
 	for _, proxy := range serverInfo.ProxyAccounts {
 		if proxy.ResolvedPrincipal != nil {
-			if err := writeCredentialNode(proxy.ResolvedSID, proxy.ResolvedPrincipal); err != nil {
-				return err
-			}
+			addCredentialNode(proxy.ResolvedSID, proxy.ResolvedPrincipal)
 		}
 	}
 
@@ -5934,6 +5950,55 @@ func (c *Collector) getDatabasePrincipalType(typeDesc string) string {
 	}
 }
 
+// writeADFiles writes accumulated AD nodes to separate files (computers.json, users.json, groups.json)
+func (c *Collector) writeADFiles() error {
+	type adFileSpec struct {
+		filename string
+		nodes    []*bloodhound.Node
+	}
+
+	specs := []adFileSpec{
+		{"computers.json", c.adComputers},
+		{"users.json", c.adUsers},
+		{"groups.json", c.adGroups},
+	}
+
+	var written []string
+	for _, spec := range specs {
+		if len(spec.nodes) == 0 {
+			continue
+		}
+
+		filePath := filepath.Join(c.tempDir, spec.filename)
+		writer, err := bloodhound.NewStreamingWriterNoSourceKind(filePath)
+		if err != nil {
+			return fmt.Errorf("failed to create %s: %w", spec.filename, err)
+		}
+
+		for _, node := range spec.nodes {
+			if err := writer.WriteNode(node); err != nil {
+				writer.Close()
+				return fmt.Errorf("failed to write node to %s: %w", spec.filename, err)
+			}
+		}
+
+		if err := writer.Close(); err != nil {
+			return fmt.Errorf("failed to close %s: %w", spec.filename, err)
+		}
+
+		c.addOutputFile(filePath)
+		nodes, _ := writer.Stats()
+		written = append(written, fmt.Sprintf("%d nodes to %s", nodes, spec.filename))
+	}
+
+	if len(written) > 0 {
+		fmt.Printf("Wrote %s\n", strings.Join(written, ", "))
+	}
+	fmt.Println("Added seed_data.json")
+
+	return nil
+}
+
 // createZipFile creates the final zip file from all output files
 func (c *Collector) createZipFile() (string, error) {
 	timestamp := time.Now().Format("20060102-150405")
@@ -5957,6 +6022,19 @@ func (c *Collector) createZipFile() (string, error) {
 		if err := addFileToZip(zipWriter, filePath); err != nil {
 			return "", fmt.Errorf("failed to add %s to zip: %w", filePath, err)
 		}
+	}
+
+	// Add embedded seed_data.json to the zip
+	seedHeader := &zip.FileHeader{
+		Name:   "seed_data.json",
+		Method: zip.Deflate,
+	}
+	seedWriter, err := zipWriter.CreateHeader(seedHeader)
+	if err != nil {
+		return "", fmt.Errorf("failed to add seed_data.json to zip: %w", err)
+	}
+	if _, err := seedWriter.Write(bloodhound.SeedDataJSON); err != nil {
+		return "", fmt.Errorf("failed to write seed_data.json to zip: %w", err)
 	}
 
 	return zipPath, nil

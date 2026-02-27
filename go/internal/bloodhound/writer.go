@@ -2,6 +2,7 @@
 package bloodhound
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,9 @@ import (
 	"path/filepath"
 	"sync"
 )
+
+//go:embed seed_data.json
+var SeedDataJSON []byte
 
 // Node represents a BloodHound graph node
 type Node struct {
@@ -54,6 +58,16 @@ type StreamingWriter struct {
 
 // NewStreamingWriter creates a new streaming BloodHound JSON writer
 func NewStreamingWriter(filePath string) (*StreamingWriter, error) {
+	return newStreamingWriter(filePath, "MSSQL_Base")
+}
+
+// NewStreamingWriterNoSourceKind creates a streaming writer without source_kind metadata.
+// Used for AD object files (computers.json, users.json, groups.json).
+func NewStreamingWriterNoSourceKind(filePath string) (*StreamingWriter, error) {
+	return newStreamingWriter(filePath, "")
+}
+
+func newStreamingWriter(filePath string, sourceKind string) (*StreamingWriter, error) {
 	// Ensure directory exists
 	dir := filepath.Dir(filePath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -74,7 +88,7 @@ func NewStreamingWriter(filePath string) (*StreamingWriter, error) {
 	}
 
 	// Write header
-	if err := w.writeHeader(); err != nil {
+	if err := w.writeHeader(sourceKind); err != nil {
 		file.Close()
 		return nil, err
 	}
@@ -83,15 +97,25 @@ func NewStreamingWriter(filePath string) (*StreamingWriter, error) {
 }
 
 // writeHeader writes the initial JSON structure
-func (w *StreamingWriter) writeHeader() error {
-	header := `{
+func (w *StreamingWriter) writeHeader(sourceKind string) error {
+	var header string
+	if sourceKind != "" {
+		header = `{
   "$schema": "https://raw.githubusercontent.com/MichaelGrafnetter/EntraAuthPolicyHound/refs/heads/main/bloodhound-opengraph.schema.json",
   "metadata": {
-    "source_kind": "MSSQL_Base"
+    "source_kind": "` + sourceKind + `"
   },
   "graph": {
     "nodes": [
 `
+	} else {
+		header = `{
+  "$schema": "https://raw.githubusercontent.com/MichaelGrafnetter/EntraAuthPolicyHound/refs/heads/main/bloodhound-opengraph.schema.json",
+  "metadata": {},
+  "graph": {
+    "nodes": [
+`
+	}
 	_, err := w.file.WriteString(header)
 	return err
 }
