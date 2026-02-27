@@ -45,6 +45,7 @@ type Config struct {
 	ZipDir        string
 	FileSizeLimit string
 	Verbose       bool
+	Debug         bool
 
 	// Collection options
 	DomainEnumOnly                  bool
@@ -856,6 +857,7 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 	client.SetDomain(c.config.Domain)
 	client.SetLDAPCredentials(c.config.LDAPUser, c.config.LDAPPassword)
 	client.SetVerbose(c.config.Verbose)
+	client.SetDebug(c.config.Debug)
 	client.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
 
 	// Quick port check before attempting EPA or authentication
@@ -873,15 +875,56 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 
 	// Run EPA checks before attempting SQL authentication
 	var epaResult *mssql.EPATestResult
+	var epaPrereqFailed bool
 	if c.config.LDAPUser != "" && c.config.LDAPPassword != "" {
 		var epaErr error
 		epaResult, epaErr = client.TestEPA(ctx)
 		if epaErr != nil {
-			c.logVerbose("EPA pre-check failed for %s: %v", server.ConnectionString, epaErr)
+			if mssql.IsEPAPrereqError(epaErr) {
+				// Prereq check failed - don't continue with authentication attempts
+				// (matches Python mssql.py flow: prereq failure => exit)
+				fmt.Printf("  EPA prereq check failed, skipping authentication: %v\n", epaErr)
+				epaPrereqFailed = true
+			} else {
+				c.logVerbose("EPA pre-check failed for %s: %v", server.ConnectionString, epaErr)
+			}
 			epaResult = nil
 		} else {
 			client.SetEPAResult(epaResult)
 		}
+	}
+
+	if epaPrereqFailed {
+		// Skip authentication - go straight to partial output handling
+		if spnInfo != nil {
+			fmt.Printf("  EPA prereq failed but server has SPN - creating nodes/edges from SPN data\n")
+			return c.processServerFromSPNData(server, spnInfo, epaResult, fmt.Errorf("EPA prereq check failed"))
+		}
+		spnInfo = c.lookupSPNsForServer(server)
+		if spnInfo != nil {
+			fmt.Printf("  EPA prereq failed - looked up SPN from AD, creating partial output\n")
+			return c.processServerFromSPNData(server, spnInfo, epaResult, fmt.Errorf("EPA prereq check failed"))
+		}
+		return fmt.Errorf("EPA prereq check failed and no SPN data available for %s", server.ConnectionString)
+	}
+
+	// If the EPA unmodified connection failed (login_failed), the credentials don't
+	// work for SQL login. Skip Connect() to avoid wasted attempts and potential
+	// account lockout with the same bad credentials.
+	if epaResult != nil && !epaResult.UnmodifiedSuccess {
+		fmt.Printf("  EPA unmodified connection failed, skipping authentication attempts\n")
+		if spnInfo != nil {
+			fmt.Printf("  Server has SPN - creating nodes/edges from SPN/EPA data\n")
+			return c.processServerFromSPNData(server, spnInfo, epaResult, fmt.Errorf("EPA unmodified connection failed"))
+		}
+		spnInfo = c.lookupSPNsForServer(server)
+		if spnInfo != nil {
+			fmt.Printf("  Looked up SPN from AD, creating partial output\n")
+			return c.processServerFromSPNData(server, spnInfo, epaResult, fmt.Errorf("EPA unmodified connection failed"))
+		}
+		// No SPN data but EPA data is available
+		fmt.Printf("  No SPN data but EPA data available, creating partial output\n")
+		return c.processServerFromSPNData(server, nil, epaResult, fmt.Errorf("EPA unmodified connection failed"))
 	}
 
 	if err := client.Connect(ctx); err != nil {
@@ -908,31 +951,49 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 			fqdnClient.SetDomain(c.config.Domain)
 			fqdnClient.SetLDAPCredentials(c.config.LDAPUser, c.config.LDAPPassword)
 			fqdnClient.SetVerbose(c.config.Verbose)
+			fqdnClient.SetDebug(c.config.Debug)
 			fqdnClient.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
 
 			// Run EPA checks before attempting SQL authentication on FQDN client
+			var fqdnEPAPrereqFailed bool
 			if c.config.LDAPUser != "" && c.config.LDAPPassword != "" {
 				fqdnEPAResult, epaErr := fqdnClient.TestEPA(ctx)
 				if epaErr != nil {
-					c.logVerbose("EPA pre-check failed for %s: %v", fqdnConnStr, epaErr)
+					if mssql.IsEPAPrereqError(epaErr) {
+						fmt.Printf("  EPA prereq check failed for FQDN %s, skipping authentication: %v\n", fqdnConnStr, epaErr)
+						fqdnEPAPrereqFailed = true
+					} else {
+						c.logVerbose("EPA pre-check failed for %s: %v", fqdnConnStr, epaErr)
+					}
 				} else {
 					fqdnClient.SetEPAResult(fqdnEPAResult)
 					epaResult = fqdnEPAResult // Use FQDN EPA result as the canonical result
 				}
 			}
 
-			fqdnErr := fqdnClient.Connect(ctx)
-			if fqdnErr == nil {
-				// FQDN connection succeeded - update server info and continue
-				fmt.Printf("  Connected using FQDN: %s\n", fqdnHostname)
-				server.Hostname = fqdnHostname
-				server.ConnectionString = fqdnConnStr
-				client = fqdnClient
-				// Fall through to continue with collection
-				goto connected
+			// Skip Connect if EPA prereq failed or unmodified connection failed
+			fqdnSkipConnect := fqdnEPAPrereqFailed
+			if !fqdnSkipConnect && epaResult != nil && !epaResult.UnmodifiedSuccess {
+				fmt.Printf("  EPA unmodified connection failed for FQDN %s, skipping authentication\n", fqdnConnStr)
+				fqdnSkipConnect = true
 			}
-			fqdnClient.Close()
-			c.logVerbose("FQDN connection also failed: %v", fqdnErr)
+			if fqdnSkipConnect {
+				fqdnClient.Close()
+				c.logVerbose("Skipping Connect for %s (EPA prereq/unmodified failed)", fqdnConnStr)
+			} else {
+				fqdnErr := fqdnClient.Connect(ctx)
+				if fqdnErr == nil {
+					// FQDN connection succeeded - update server info and continue
+					fmt.Printf("  Connected using FQDN: %s\n", fqdnHostname)
+					server.Hostname = fqdnHostname
+					server.ConnectionString = fqdnConnStr
+					client = fqdnClient
+					// Fall through to continue with collection
+					goto connected
+				}
+				fqdnClient.Close()
+				c.logVerbose("FQDN connection also failed: %v", fqdnErr)
+			}
 		}
 
 		// Connection failed - check if we have SPN data to create partial output

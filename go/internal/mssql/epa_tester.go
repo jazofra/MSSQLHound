@@ -28,6 +28,7 @@ type EPATestConfig struct {
 	Password     string
 	TestMode     EPATestMode
 	Verbose      bool
+	Debug        bool
 	DisableMIC         bool // Diagnostic: omit MsvAvFlags and MIC from Type3
 	UseRawTargetInfo   bool // Diagnostic: use server's raw target info (no EPA mods, no MIC)
 	UseClientTimestamp bool // Diagnostic: use time.Now() FILETIME instead of server's MsvAvTimestamp
@@ -87,7 +88,7 @@ const (
 //  8. Receive final response: LOGINACK = success, ERROR = failure
 func runEPATest(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, byte, error) {
 	logf := func(format string, args ...interface{}) {
-		if config.Verbose {
+		if config.Debug {
 			fmt.Printf("    [EPA-debug] "+format+"\n", args...)
 		}
 	}
@@ -244,7 +245,7 @@ func runEPATest(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, by
 			Success:           success,
 			ErrorMessage:      errMsg,
 			IsUntrustedDomain: strings.Contains(errMsg, "untrusted domain"),
-			IsLoginFailed:     strings.Contains(errMsg, "Login failed"),
+			IsLoginFailed:     !strings.Contains(errMsg, "untrusted domain") && strings.Contains(errMsg, "Login failed for"),
 		}, encryptionFlag, nil
 	}
 	logf("Extracted NTLM Type2 challenge: %d bytes", len(challengeData))
@@ -320,7 +321,7 @@ func runEPATest(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, by
 		Success:           success,
 		ErrorMessage:      errMsg,
 		IsUntrustedDomain: strings.Contains(errMsg, "untrusted domain"),
-		IsLoginFailed:     strings.Contains(errMsg, "Login failed"),
+		IsLoginFailed:     !strings.Contains(errMsg, "untrusted domain") && strings.Contains(errMsg, "Login failed for"),
 	}, encryptionFlag, nil
 }
 
@@ -663,7 +664,7 @@ func parseErrorToken(data []byte) string {
 // cleartext PRELOGIN packets.
 func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutcome, byte, error) {
 	logf := func(format string, args ...interface{}) {
-		if config.Verbose {
+		if config.Debug {
 			fmt.Printf("    [EPA-debug] "+format+"\n", args...)
 		}
 	}
@@ -793,7 +794,7 @@ func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutco
 			Success:           success,
 			ErrorMessage:      errMsg,
 			IsUntrustedDomain: strings.Contains(errMsg, "untrusted domain"),
-			IsLoginFailed:     strings.Contains(errMsg, "Login failed"),
+			IsLoginFailed:     !strings.Contains(errMsg, "untrusted domain") && strings.Contains(errMsg, "Login failed for"),
 		}, encryptionFlag, nil
 	}
 	logf("Extracted NTLM Type2 challenge: %d bytes", len(challengeData))
@@ -857,7 +858,7 @@ func runEPATestStrict(ctx context.Context, config *EPATestConfig) (*epaTestOutco
 		Success:           success,
 		ErrorMessage:      errMsg,
 		IsUntrustedDomain: strings.Contains(errMsg, "untrusted domain"),
-		IsLoginFailed:     strings.Contains(errMsg, "Login failed"),
+		IsLoginFailed:     !strings.Contains(errMsg, "untrusted domain") && strings.Contains(errMsg, "Login failed for"),
 	}, encryptionFlag, nil
 }
 

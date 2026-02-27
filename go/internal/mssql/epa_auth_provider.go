@@ -27,6 +27,7 @@ type epaAuthProvider struct {
 	cbt     []byte // Channel binding token (16-byte MD5 of SEC_CHANNEL_BINDINGS)
 	spn     string // Service Principal Name (MSSQLSvc/hostname:port)
 	verbose bool
+	debug   bool
 }
 
 // SetCBT stores the channel binding hash for the next authentication.
@@ -62,7 +63,7 @@ func (p *epaAuthProvider) GetIntegratedAuthenticator(config msdsn.Config) (integ
 	spn := p.spn
 	p.mu.Unlock()
 
-	if p.verbose {
+	if p.debug {
 		fmt.Printf("    [EPA-auth] GetIntegratedAuthenticator: domain=%s, user=%s, spn=%s, cbt=%x (%d bytes)\n",
 			domain, username, spn, cbt, len(cbt))
 	}
@@ -71,7 +72,7 @@ func (p *epaAuthProvider) GetIntegratedAuthenticator(config msdsn.Config) (integ
 	auth.SetEPATestMode(EPATestNormal)
 	if len(cbt) == 16 {
 		auth.SetChannelBindingHash(cbt)
-	} else {
+	} else if p.debug {
 		fmt.Printf("    [EPA-auth] WARNING: CBT not set (len=%d, expected 16)!\n", len(cbt))
 	}
 

@@ -14,12 +14,10 @@ import (
 )
 
 var (
-	version = "1.1.0"
+	version = "2.0.0"
 
-	// Connection options
+	// Shared connection options (persistent - inherited by subcommands)
 	serverInstance string
-	serverListFile string
-	serverList     string
 	userID         string
 	password       string
 	domain         string
@@ -27,15 +25,18 @@ var (
 	dnsResolver    string
 	ldapUser       string
 	ldapPassword   string
+	verbose        bool
+	debug          bool
+	proxyAddr      string
 
-	// Output options
-	outputFormat  string
-	tempDir       string
-	zipDir        string
-	fileSizeLimit string
-	verbose       bool
+	// Collection-specific options (local to root command)
+	serverListFile string
+	serverList     string
+	outputFormat   string
+	tempDir        string
+	zipDir         string
+	fileSizeLimit  string
 
-	// Collection options
 	domainEnumOnly                  bool
 	skipLinkedServerEnum            bool
 	collectFromLinkedServers        bool
@@ -45,16 +46,10 @@ var (
 	includeNontraversableEdges      bool
 	makeInterestingEdgesTraversable bool
 
-	// Timeouts and limits
 	linkedServerTimeout    int
 	memoryThresholdPercent int
 	fileSizeUpdateInterval int
-
-	// Concurrency
-	workers int
-
-	// Proxy
-	proxyAddr string
+	workers                int
 )
 
 func main() {
@@ -70,26 +65,26 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 		RunE:    run,
 	}
 
-	// Connection flags
-	rootCmd.Flags().StringVarP(&serverInstance, "server", "s", "", "SQL Server instance to collect from (host, host:port, or host\\instance)")
+	// Shared connection flags (persistent - available to subcommands)
+	rootCmd.PersistentFlags().StringVarP(&serverInstance, "server", "s", "", "SQL Server instance to collect from (host, host:port, or host\\instance)")
+	rootCmd.PersistentFlags().StringVarP(&userID, "user", "u", "", "SQL login username")
+	rootCmd.PersistentFlags().StringVarP(&password, "password", "p", "", "SQL login password")
+	rootCmd.PersistentFlags().StringVarP(&domain, "domain", "d", "", "Domain to use for name and SID resolution")
+	rootCmd.PersistentFlags().StringVar(&dcIP, "dc-ip", "", "Domain controller hostname or IP (used for LDAP and as DNS resolver if --dns-resolver not specified)")
+	rootCmd.PersistentFlags().StringVar(&dnsResolver, "dns-resolver", "", "DNS resolver IP address for domain lookups")
+	rootCmd.PersistentFlags().StringVar(&ldapUser, "ldap-user", "", "LDAP user (DOMAIN\\user or user@domain) for GSSAPI/Kerberos bind")
+	rootCmd.PersistentFlags().StringVar(&ldapPassword, "ldap-password", "", "LDAP password for GSSAPI/Kerberos bind")
+	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output showing detailed collection progress")
+	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "Enable debug output (includes EPA/TLS/NTLM diagnostics)")
+	rootCmd.PersistentFlags().StringVar(&proxyAddr, "proxy", "", "SOCKS5 proxy address (host:port or socks5://[user:pass@]host:port)")
+
+	// Collection-specific flags (local to root command only)
 	rootCmd.Flags().StringVar(&serverListFile, "server-list-file", "", "File containing list of servers (one per line)")
 	rootCmd.Flags().StringVar(&serverList, "server-list", "", "Comma-separated list of servers")
-	rootCmd.Flags().StringVarP(&userID, "user", "u", "", "SQL login username")
-	rootCmd.Flags().StringVarP(&password, "password", "p", "", "SQL login password")
-	rootCmd.Flags().StringVarP(&domain, "domain", "d", "", "Domain to use for name and SID resolution")
-	rootCmd.Flags().StringVar(&dcIP, "dc-ip", "", "Domain controller hostname or IP (used for LDAP and as DNS resolver if --dns-resolver not specified)")
-	rootCmd.Flags().StringVar(&dnsResolver, "dns-resolver", "", "DNS resolver IP address for domain lookups")
-	rootCmd.Flags().StringVar(&ldapUser, "ldap-user", "", "LDAP user (DOMAIN\\user or user@domain) for GSSAPI/Kerberos bind")
-	rootCmd.Flags().StringVar(&ldapPassword, "ldap-password", "", "LDAP password for GSSAPI/Kerberos bind")
-
-	// Output flags
 	rootCmd.Flags().StringVarP(&outputFormat, "output-format", "o", "BloodHound", "Output format: BloodHound, BHGeneric")
 	rootCmd.Flags().StringVar(&tempDir, "temp-dir", "", "Temporary directory for output files")
 	rootCmd.Flags().StringVar(&zipDir, "zip-dir", ".", "Directory for final zip file")
 	rootCmd.Flags().StringVar(&fileSizeLimit, "file-size-limit", "1GB", "Stop enumeration after files exceed this size")
-	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output showing detailed collection progress")
-
-	// Collection flags
 	rootCmd.Flags().BoolVar(&domainEnumOnly, "domain-enum-only", false, "Only enumerate SPNs, skip MSSQL collection")
 	rootCmd.Flags().BoolVar(&skipLinkedServerEnum, "skip-linked-servers", false, "Don't enumerate linked servers")
 	rootCmd.Flags().BoolVar(&collectFromLinkedServers, "collect-from-linked", false, "Perform full collection on discovered linked servers")
@@ -98,17 +93,13 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	rootCmd.Flags().BoolVar(&skipADNodeCreation, "skip-ad-nodes", false, "Skip creating User, Group, Computer nodes")
 	rootCmd.Flags().BoolVar(&includeNontraversableEdges, "include-nontraversable", false, "Include non-traversable edges")
 	rootCmd.Flags().BoolVar(&makeInterestingEdgesTraversable, "make-interesting-traversable", true, "Make interesting edges traversable (default true)")
-
-	// Timeout/limit flags
 	rootCmd.Flags().IntVar(&linkedServerTimeout, "linked-timeout", 300, "Linked server enumeration timeout (seconds)")
 	rootCmd.Flags().IntVar(&memoryThresholdPercent, "memory-threshold", 90, "Stop when memory exceeds this percentage")
 	rootCmd.Flags().IntVar(&fileSizeUpdateInterval, "size-update-interval", 5, "Interval for file size updates (seconds)")
-
-	// Concurrency flags
 	rootCmd.Flags().IntVarP(&workers, "workers", "w", 0, "Number of concurrent workers (0 = sequential processing)")
 
-	// Proxy flags
-	rootCmd.Flags().StringVar(&proxyAddr, "proxy", "", "SOCKS5 proxy address (host:port or socks5://[user:pass@]host:port)")
+	// Register subcommands
+	rootCmd.AddCommand(newTestEPAMatrixCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -182,6 +173,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ZipDir:                          zipDir,
 		FileSizeLimit:                   fileSizeLimit,
 		Verbose:                         verbose,
+		Debug:                           debug,
 		DomainEnumOnly:                  domainEnumOnly,
 		SkipLinkedServerEnum:            skipLinkedServerEnum,
 		CollectFromLinkedServers:        collectFromLinkedServers,

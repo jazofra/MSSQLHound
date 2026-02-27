@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -30,7 +31,7 @@ import (
 // All data transparently flows through our outer TLS layer, which is correct
 // for TDS 8.0 strict encryption (TLS wraps the entire TDS session).
 type epaTLSDialer struct {
-	underlying  interface {
+	underlying interface {
 		DialContext(ctx context.Context, network, address string) (net.Conn, error)
 	}
 	epaProvider *epaAuthProvider
@@ -163,11 +164,15 @@ func (d *epaTDSDialer) DialContext(ctx context.Context, network, addr string) (n
 		d.logf("  [EPA-TDS] WARNING: TLSUnique empty after TDS TLS handshake (TLS 0x%04X)", state.Version)
 	}
 
-	// Return wrapper that intercepts go-mssqldb's PRELOGIN and fakes the response
+	// Return wrapper that intercepts go-mssqldb's PRELOGIN and fakes the response.
+	// For ENCRYPT_OFF, the server drops TLS after LOGIN7 — preloginFakerConn
+	// detects this and switches to raw TCP for subsequent I/O.
 	return &preloginFakerConn{
-		Conn:     tlsConn,
-		fakeResp: buildFakePreloginResponse(),
-		logf:     d.logf,
+		Conn:       tlsConn,
+		rawConn:    conn,
+		fakeResp:   buildFakePreloginResponse(),
+		logf:       d.logf,
+		encryptOff: encryptionFlag == encryptOff,
 	}, nil
 }
 
@@ -175,13 +180,18 @@ func (d *epaTDSDialer) DialContext(ctx context.Context, network, addr string) (n
 // exchange. Since we already performed the real PRELOGIN + TLS handshake in the
 // dialer, we discard go-mssqldb's PRELOGIN write and return a fake response
 // with encryption=NOT_SUP so go-mssqldb skips its own TLS negotiation.
-// After the fake exchange, all reads/writes pass through to the TLS connection.
+//
+// For ENCRYPT_OFF (Force Encryption=No), the server drops TLS immediately after
+// LOGIN7, so this wrapper detects LOGIN7 writes and switches subsequent I/O to
+// raw TCP — matching the EPA tester's behavior in runEPATest.
 type preloginFakerConn struct {
-	net.Conn
-	state      int    // 0: intercept prelogin, 1: pass through
-	fakeResp   []byte // fake PRELOGIN response TDS packet
-	fakeOffset int    // bytes consumed from fakeResp
+	net.Conn              // TLS connection (used during LOGIN7 phase)
+	rawConn    net.Conn   // raw TCP connection (used after LOGIN7 for ENCRYPT_OFF)
+	state      int        // 0: intercept prelogin, 1: TLS pass-through, 2: raw TCP pass-through
+	fakeResp   []byte     // fake PRELOGIN response TDS packet
+	fakeOffset int        // bytes consumed from fakeResp
 	logf       func(string, ...interface{})
+	encryptOff bool       // true when server uses ENCRYPT_OFF (drops TLS after LOGIN7)
 }
 
 func (c *preloginFakerConn) Write(b []byte) (int, error) {
@@ -193,10 +203,28 @@ func (c *preloginFakerConn) Write(b []byte) (int, error) {
 			}
 			return len(b), nil
 		}
-		// Not a PRELOGIN packet - switch to pass-through
+		// Not a PRELOGIN packet - switch to TLS pass-through
 		c.state = 1
 	}
-	return c.Conn.Write(b)
+	if c.state == 2 {
+		// Post-LOGIN7 for ENCRYPT_OFF: write directly on raw TCP
+		return c.rawConn.Write(b)
+	}
+	// State 1: write through TLS (encrypts LOGIN7)
+	n, err := c.Conn.Write(b)
+	if err != nil {
+		return n, err
+	}
+	// For ENCRYPT_OFF: after LOGIN7 with EOM is sent, the server drops TLS.
+	// Switch to raw TCP for all subsequent I/O (SSPI challenge/response, queries).
+	// This matches epa_tester.go line 217-221: "sw.c = conn" after LOGIN7.
+	if c.encryptOff && len(b) >= tdsHeaderSize && b[0] == tdsPacketLogin7 && (b[1]&0x01 != 0) {
+		c.state = 2
+		if c.logf != nil {
+			c.logf("  [EPA-TDS] LOGIN7 sent via TLS, switching to raw TCP (ENCRYPT_OFF)")
+		}
+	}
+	return n, err
 }
 
 func (c *preloginFakerConn) Read(b []byte) (int, error) {
@@ -205,12 +233,16 @@ func (c *preloginFakerConn) Read(b []byte) (int, error) {
 		n := copy(b, c.fakeResp[c.fakeOffset:])
 		c.fakeOffset += n
 		if c.fakeOffset >= len(c.fakeResp) {
-			c.state = 1 // Done faking, switch to pass-through
+			c.state = 1 // Done faking, switch to TLS pass-through
 			if c.logf != nil {
 				c.logf("  [EPA-TDS] Delivered fake PRELOGIN response, switching to pass-through")
 			}
 		}
 		return n, nil
+	}
+	if c.state == 2 {
+		// Post-LOGIN7 for ENCRYPT_OFF: read directly from raw TCP
+		return c.rawConn.Read(b)
 	}
 	return c.Conn.Read(b)
 }
@@ -227,7 +259,7 @@ func buildFakePreloginResponse() []byte {
 	payload := []byte{
 		0x00, 0x00, 0x0B, 0x00, 0x06, // Version: offset=11, len=6
 		0x01, 0x00, 0x11, 0x00, 0x01, // Encryption: offset=17, len=1
-		0xFF,                         // Terminator
+		0xFF,                               // Terminator
 		0x0F, 0x00, 0x07, 0xD0, 0x00, 0x00, // Version data (SQL Server 2019)
 		0x02, // Encryption: NOT_SUP
 	}
@@ -316,6 +348,7 @@ type Client struct {
 	ldapPassword             string // LDAP password for EPA testing
 	useWindowsAuth           bool
 	verbose                  bool
+	debug                    bool
 	encrypt                  bool              // Whether to use encryption
 	usePowerShell            bool              // Whether using PowerShell fallback
 	psClient                 *PowerShellClient // PowerShell client for fallback
@@ -486,15 +519,23 @@ func (c *Client) connectNative(ctx context.Context) error {
 		certHostname string // HostNameInCertificate for strict encryption
 	}
 
-	strategies := []connStrategy{
-		// Try FQDN/IP with encryption (most common)
-		{"FQDN+encrypt", c.hostname, "true", false, "", ""},
-		// Try TDS 8.0 strict encryption (for servers enforcing strict)
-		{"FQDN+strict", c.hostname, "strict", false, "", certHost},
-		// Try with explicit SPN
-		{"FQDN+encrypt+SPN", c.hostname, "true", true, c.hostname, ""},
-		// Try without encryption
-		{"FQDN+no-encrypt", c.hostname, "false", false, "", ""},
+	var strategies []connStrategy
+	if c.epaResult != nil && c.epaResult.StrictEncryption {
+		// If EPA tester detected strict encryption, try strict first
+		strategies = []connStrategy{
+			{"FQDN+strict", c.hostname, "strict", false, "", certHost},
+			{"FQDN+encrypt", c.hostname, "true", false, "", ""},
+			{"FQDN+encrypt+SPN", c.hostname, "true", true, c.hostname, ""},
+			{"FQDN+no-encrypt", c.hostname, "false", false, "", ""},
+		}
+	} else {
+		// Default order: try encryption first (most common)
+		strategies = []connStrategy{
+			{"FQDN+encrypt", c.hostname, "true", false, "", ""},
+			{"FQDN+strict", c.hostname, "strict", false, "", certHost},
+			{"FQDN+encrypt+SPN", c.hostname, "true", true, c.hostname, ""},
+			{"FQDN+no-encrypt", c.hostname, "false", false, "", ""},
+		}
 	}
 
 	// Only add short hostname strategies for FQDNs (not IP addresses)
@@ -511,7 +552,7 @@ func (c *Client) connectNative(ctx context.Context) error {
 	// support EPA, so without this, all strategies fail with "untrusted domain".
 	var epaProvider *epaAuthProvider
 	if c.epaResult != nil && (c.epaResult.EPAStatus == "Required" || c.epaResult.EPAStatus == "Allowed") {
-		epaProvider = &epaAuthProvider{verbose: c.verbose}
+		epaProvider = &epaAuthProvider{verbose: c.verbose, debug: c.debug}
 		port := c.port
 		if port == 0 {
 			port = 1433
@@ -534,7 +575,7 @@ func (c *Client) connectNative(ctx context.Context) error {
 			underlying:  c.proxyDialer,
 			epaProvider: epaProvider,
 			hostname:    c.hostname,
-			logf:        c.logVerbose,
+			logf:        c.logDebug,
 		}
 		connStr := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;encrypt=disable;TrustServerCertificate=true;app name=MSSQLHound",
 			c.hostname, port, c.userID, c.password)
@@ -584,7 +625,7 @@ func (c *Client) connectNative(ctx context.Context) error {
 			underlying:  c.proxyDialer,
 			epaProvider: epaProvider,
 			hostname:    c.hostname,
-			logf:        c.logVerbose,
+			logf:        c.logDebug,
 		}
 		connStr := fmt.Sprintf("server=%s;port=%d;user id=%s;password=%s;encrypt=disable;TrustServerCertificate=true;app name=MSSQLHound",
 			c.hostname, port, c.userID, c.password)
@@ -666,14 +707,14 @@ func (c *Client) connectNative(ctx context.Context) error {
 			config.TLSConfig.MaxVersion = tls.VersionTLS12
 
 			config.TLSConfig.VerifyConnection = func(cs tls.ConnectionState) error {
-				c.logVerbose("  [EPA-TLS] VerifyConnection fired: TLS 0x%04X, TLSUnique=%x (%d bytes), certs=%d",
+				c.logDebug("  [EPA-TLS] VerifyConnection fired: TLS 0x%04X, TLSUnique=%x (%d bytes), certs=%d",
 					cs.Version, cs.TLSUnique, len(cs.TLSUnique), len(cs.PeerCertificates))
 				if len(cs.TLSUnique) > 0 {
 					cbt := computeCBTHash("tls-unique:", cs.TLSUnique)
 					epaProvider.SetCBT(cbt)
-					c.logVerbose("  [EPA-TLS] Set CBT (tls-unique): %x", cbt)
+					c.logDebug("  [EPA-TLS] Set CBT (tls-unique): %x", cbt)
 				} else {
-					c.logVerbose("  [EPA-TLS] WARNING: TLSUnique empty, no CBT set!")
+					c.logDebug("  [EPA-TLS] WARNING: TLSUnique empty, no CBT set!")
 				}
 				return nil
 			}
@@ -870,6 +911,11 @@ func (c *Client) SetVerbose(verbose bool) {
 	c.verbose = verbose
 }
 
+// SetDebug enables or disables debug logging (EPA/TLS/NTLM diagnostics)
+func (c *Client) SetDebug(debug bool) {
+	c.debug = debug
+}
+
 func (c *Client) SetCollectFromLinkedServers(collect bool) {
 	c.collectFromLinkedServers = collect
 }
@@ -904,6 +950,35 @@ func (c *Client) logVerbose(format string, args ...interface{}) {
 	if c.verbose {
 		fmt.Printf(format+"\n", args...)
 	}
+}
+
+// logDebug logs a message only if debug mode is enabled
+func (c *Client) logDebug(format string, args ...interface{}) {
+	if c.debug {
+		fmt.Printf(format+"\n", args...)
+	}
+}
+
+// EPAPrereqError indicates that the EPA prerequisite check failed.
+// When this error is returned, no further EPA tests or MSSQL authentication
+// attempts should be made (to match the Python mssql.py flow and avoid
+// account lockout with invalid credentials).
+type EPAPrereqError struct {
+	Err error
+}
+
+func (e *EPAPrereqError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *EPAPrereqError) Unwrap() error {
+	return e.Err
+}
+
+// IsEPAPrereqError checks if an error is an EPA prerequisite failure.
+func IsEPAPrereqError(err error) bool {
+	var prereqErr *EPAPrereqError
+	return errors.As(err, &prereqErr)
 }
 
 // EPATestResult holds the results of EPA connection testing
@@ -961,7 +1036,7 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 		return &EPATestConfig{
 			Hostname: c.hostname, Port: port, InstanceName: c.instanceName,
 			Domain: epaDomain, Username: epaUsername, Password: c.ldapPassword,
-			TestMode: mode, Verbose: c.verbose,
+			TestMode: mode, Verbose: c.verbose, Debug: c.debug,
 			ProxyDialer: c.proxyDialer,
 		}
 	}
@@ -973,11 +1048,18 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 		// The normal TDS 7.x PRELOGIN failed. This may indicate the server
 		// enforces TDS 8.0 strict encryption (TLS before any TDS messages).
 		c.logVerbose("  Normal PRELOGIN failed (%v), trying TDS 8.0 strict encryption flow...", err)
-		_, strictEncFlag, strictErr := runEPATestStrict(ctx, baseConfig(EPATestNormal))
+		strictPrereqResult, strictEncFlag, strictErr := runEPATestStrict(ctx, baseConfig(EPATestNormal))
 		if strictErr != nil {
-			return nil, fmt.Errorf("EPA prereq check failed (tried normal and TDS 8.0 strict): normal=%w, strict=%v", err, strictErr)
+			return nil, &EPAPrereqError{Err: fmt.Errorf("EPA prereq check failed (tried normal and TDS 8.0 strict): normal=%v, strict=%v", err, strictErr)}
 		}
-		// TDS 8.0 strict encryption confirmed.
+		// TDS 8.0 strict encryption confirmed - validate prereq result
+		if !strictPrereqResult.Success && !strictPrereqResult.IsLoginFailed {
+			if strictPrereqResult.IsUntrustedDomain {
+				return nil, &EPAPrereqError{Err: fmt.Errorf("EPA prereq check failed (strict): credentials rejected (untrusted domain)")}
+			}
+			return nil, &EPAPrereqError{Err: fmt.Errorf("EPA prereq check failed (strict): unexpected response: %s", strictPrereqResult.ErrorMessage)}
+		}
+		result.UnmodifiedSuccess = strictPrereqResult.Success
 		result.EncryptionFlag = encryptStrict
 		result.StrictEncryption = true
 		result.ForceEncryption = strictEncFlag == encryptReq
@@ -985,6 +1067,7 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 		c.logVerbose("  Encryption flag (from strict PRELOGIN): 0x%02X", strictEncFlag)
 		c.logVerbose("  Strict Encryption (TDS 8.0): Yes")
 		c.logVerbose("  Force Encryption: %s", boolToYesNo(result.ForceEncryption))
+		c.logVerbose("  Unmodified connection (strict): %s", boolToSuccessFail(strictPrereqResult.Success))
 
 		// Determine EPA enforcement via channel binding tests over strict TLS.
 		// Strict mode is always encrypted, so test channel binding (like encryptReq path).
@@ -1033,9 +1116,9 @@ func (c *Client) TestEPA(ctx context.Context) (*EPATestResult, error) {
 	// Prereq must succeed or produce "login failed" (valid credentials response)
 	if !prereqResult.Success && !prereqResult.IsLoginFailed {
 		if prereqResult.IsUntrustedDomain {
-			return nil, fmt.Errorf("EPA prereq check failed: credentials rejected (untrusted domain)")
+			return nil, &EPAPrereqError{Err: fmt.Errorf("EPA prereq check failed: credentials rejected (untrusted domain)")}
 		}
-		return nil, fmt.Errorf("EPA prereq check failed: unexpected response: %s", prereqResult.ErrorMessage)
+		return nil, &EPAPrereqError{Err: fmt.Errorf("EPA prereq check failed: unexpected response: %s", prereqResult.ErrorMessage)}
 	}
 	result.UnmodifiedSuccess = prereqResult.Success
 	c.logVerbose("  Unmodified connection: %s", boolToSuccessFail(prereqResult.Success))
