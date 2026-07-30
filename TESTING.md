@@ -326,6 +326,46 @@ The unit test suite covers 38+ edge types including:
 
 Each edge type includes both positive tests (edge is created) and negative tests (edge is NOT created when conditions aren't met).
 
+## Named Pipe Transport Tests
+
+The named-pipe transport (`--named-pipe`) carries TDS over SMB. Its unit tests are ordinary untagged tests and run everywhere:
+
+- `internal/mssql/nptransport/pipeconn_test.go` — the `net.Conn` adapter. `TestReadAlwaysRequestsFullBuffer` is the single most important test in the package: go-mssqldb opens every TDS packet with an 8-byte header read, and if that reached the pipe as an 8-byte SMB read the server would answer `STATUS_BUFFER_OVERFLOW` and the SMB client would discard the payload, desynchronising the stream. Do not relax that assertion.
+- `internal/mssql/nptransport/nptransport_test.go` — `TestInitRegistersDialerOnly` and `TestParseUnaffectedByRegistration` enforce the opt-in promise. Registering a `msdsn.ProtocolParser` would add the protocol to every TCP connection in the process and double `DialTimeout`; these tests fail loudly if anyone does.
+- `internal/mssql/nptransport/wire_test.go` — drives a real go-mssqldb connector over a scripted fake pipe. This is the only test covering the full wiring (protocol routing, parameter lookup, adapter, packet framing) without a live server.
+- `internal/mssql/namedpipe_test.go` — reachability, connection strings, SPN derivation and the account-lockout guard.
+
+### Live testing
+
+CI cannot cover this end to end: the integration job runs SQL Server on **Linux**, which does not serve named pipes. `internal/mssql/namedpipe_integration_test.go` is tagged `integration` and skips unless pointed at a Windows target:
+
+```bash
+export MSSQLHOUND_NP_HOST=sql01.contoso.com
+export MSSQLHOUND_NP_USER='CONTOSO\analyst'
+export MSSQLHOUND_NP_PASSWORD='password'
+go test -tags integration -v ./internal/mssql/ -run TestNamedPipe
+```
+
+| Variable | Purpose |
+|----------|---------|
+| `MSSQLHOUND_NP_HOST` | Windows host running SQL Server (FQDN preferred for Kerberos) |
+| `MSSQLHOUND_NP_USER` | SMB user, `DOMAIN\user` or `user@domain` |
+| `MSSQLHOUND_NP_PASSWORD` | Password for that user |
+| `MSSQLHOUND_NP_INSTANCE` | Named instance to target (optional) |
+| `MSSQLHOUND_NP_PATH` | Explicit pipe path under `IPC$` (optional) |
+| `MSSQLHOUND_NP_SQL_USER` / `MSSQLHOUND_NP_SQL_PASS` | SQL login, when it differs from the SMB identity |
+
+Manual matrix worth walking before releasing changes to this transport:
+
+1. **Default instance** with TCP/IP enabled — the pipe should work even though TCP would have.
+2. **Default instance with TCP/IP disabled** — the case the feature exists for.
+3. **Named instance** — confirm `MSSQL$<INSTANCE>\sql\query` is opened and no SQL Browser traffic is generated.
+4. **Windows Internal Database as local administrator** — expect a successful connection and an instance of `MICROSOFT##WID`.
+5. **Windows Internal Database as an unprivileged user** — expect access denied. This is the correct result, not a bug.
+6. **Through SOCKS5** (`-x`) — the main reason the transport is implemented in-process.
+7. **Kerberos** (`-k`) — confirm both a `cifs/` and an `MSSQLSvc/` ticket are issued from one login.
+8. **Strict encryption instance** — expect a clear report that TDS 8.0 cannot work over a pipe, with no retry.
+
 ## EPA Test Matrix
 
 The `test-epa-matrix` subcommand systematically validates EPA (Extended Protection for Authentication) detection by cycling through all combinations of SQL Server encryption/protection registry settings, restarting the service for each combination, and running 5 NTLM authentication variations to detect the effective EPA enforcement level.

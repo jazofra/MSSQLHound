@@ -46,11 +46,30 @@ type krb5CustomProvider struct {
 	logger         *slog.Logger
 }
 
-// GetIntegratedAuthenticator creates a custom Kerberos authenticator.
-func (p *krb5CustomProvider) GetIntegratedAuthenticator(cfg msdsn.Config) (integratedauth.IntegratedAuthenticator, error) {
+// krb5ClientOptions describes how to obtain a logged-in Kerberos client.
+type krb5ClientOptions struct {
+	ConfigFile string
+	CCacheFile string
+	KeytabFile string
+	Realm      string
+	User       string
+	Password   string
+}
+
+// newKrb5Client loads the Kerberos configuration, selects a credential source
+// and performs the login, returning a client ready to request service tickets.
+//
+// This is separated from GetIntegratedAuthenticator so that the SMB transport can
+// obtain a client from the same credentials. gokrb5 caches a service ticket per
+// SPN against the one TGT, so a single client serves both the cifs/HOST ticket
+// that opens the named pipe and the MSSQLSvc/... ticket that authenticates the
+// database session — one login, two tickets.
+//
+// The returned client owns OS resources; callers must Destroy it.
+func newKrb5Client(o krb5ClientOptions, log *slog.Logger, verbose bool) (*client.Client, error) {
 	// Parse username: handle user@realm and DOMAIN\user formats
-	username := cfg.User
-	realm := p.krb5Realm
+	username := o.User
+	realm := o.Realm
 
 	if realm == "" {
 		if parts := strings.SplitN(username, "@", 2); len(parts) == 2 {
@@ -67,7 +86,7 @@ func (p *krb5CustomProvider) GetIntegratedAuthenticator(cfg msdsn.Config) (integ
 	}
 
 	// Load krb5 config
-	krb5ConfigFile := p.krb5ConfigFile
+	krb5ConfigFile := o.ConfigFile
 	if krb5ConfigFile == "" {
 		krb5ConfigFile = os.Getenv("KRB5_CONFIG")
 	}
@@ -96,11 +115,11 @@ func (p *krb5CustomProvider) GetIntegratedAuthenticator(cfg msdsn.Config) (integ
 	var krb5Client *client.Client
 
 	switch {
-	case username != "" && cfg.Password != "":
-		krb5Client = client.NewWithPassword(username, realm, cfg.Password, krb5Cfg, client.DisablePAFXFAST(true))
+	case username != "" && o.Password != "":
+		krb5Client = client.NewWithPassword(username, realm, o.Password, krb5Cfg, client.DisablePAFXFAST(true))
 
-	case p.krb5KeytabFile != "":
-		data, err := os.ReadFile(p.krb5KeytabFile)
+	case o.KeytabFile != "":
+		data, err := os.ReadFile(o.KeytabFile)
 		if err != nil {
 			return nil, fmt.Errorf("krb5-custom: reading keytab: %w", err)
 		}
@@ -112,7 +131,7 @@ func (p *krb5CustomProvider) GetIntegratedAuthenticator(cfg msdsn.Config) (integ
 
 	default:
 		// Try credential cache
-		ccacheFile := p.krb5CCacheFile
+		ccacheFile := o.CCacheFile
 		if ccacheFile == "" {
 			ccacheFile = os.Getenv("KRB5CCNAME")
 		}
@@ -135,12 +154,28 @@ func (p *krb5CustomProvider) GetIntegratedAuthenticator(cfg msdsn.Config) (integ
 		return nil, fmt.Errorf("krb5-custom: Kerberos login: %w", err)
 	}
 
-	if p.verbose && p.logger != nil {
-		p.logger.Log(context.Background(), logging.LevelVerbose, "Kerberos client created",
+	if verbose && log != nil {
+		log.Log(context.Background(), logging.LevelVerbose, "Kerberos client created",
 			"username", username,
 			"realm", realm,
-			"serverSPN", cfg.ServerSPN,
 		)
+	}
+
+	return krb5Client, nil
+}
+
+// GetIntegratedAuthenticator creates a custom Kerberos authenticator.
+func (p *krb5CustomProvider) GetIntegratedAuthenticator(cfg msdsn.Config) (integratedauth.IntegratedAuthenticator, error) {
+	krb5Client, err := newKrb5Client(krb5ClientOptions{
+		ConfigFile: p.krb5ConfigFile,
+		CCacheFile: p.krb5CCacheFile,
+		KeytabFile: p.krb5KeytabFile,
+		Realm:      p.krb5Realm,
+		User:       cfg.User,
+		Password:   cfg.Password,
+	}, p.logger, p.verbose)
+	if err != nil {
+		return nil, err
 	}
 
 	return &krb5CustomAuthenticator{

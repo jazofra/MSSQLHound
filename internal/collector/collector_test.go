@@ -1348,3 +1348,79 @@ func TestRunDomainEnumOnlySkipsCollection(t *testing.T) {
 		t.Fatalf("expected no files to be created, found %d", len(entries))
 	}
 }
+
+// TestScanAllComputerServersNamedPipeOnFirstPortOnly guards against collecting
+// the same instance once per scanned port. Every entry for a host would otherwise
+// probe 445 and fall back to the same named pipe.
+func TestScanAllComputerServersNamedPipeOnFirstPortOnly(t *testing.T) {
+	collector := &Collector{config: &Config{ScanAllComputerPorts: []int{1433, 1434, 14330}}}
+
+	servers := collector.scanAllComputerServers(domainComputer{Hostname: "sql01", SID: "S-1-5-21-1"})
+	if len(servers) != 3 {
+		t.Fatalf("got %d servers, want 3", len(servers))
+	}
+	if servers[0].SkipNamedPipe {
+		t.Error("first port entry must allow the named-pipe fallback")
+	}
+	for i, s := range servers[1:] {
+		if !s.SkipNamedPipe {
+			t.Errorf("entry %d (port %d) must skip the named-pipe fallback", i+1, s.Port)
+		}
+	}
+}
+
+func TestScanAllComputerServersSinglePortAllowsNamedPipe(t *testing.T) {
+	collector := &Collector{config: &Config{}}
+
+	servers := collector.scanAllComputerServers(domainComputer{Hostname: "sql01", SID: "S-1-5-21-1"})
+	if len(servers) != 1 {
+		t.Fatalf("got %d servers, want 1", len(servers))
+	}
+	if servers[0].SkipNamedPipe {
+		t.Error("the only entry must allow the named-pipe fallback")
+	}
+}
+
+func TestAssignObjectIdentifier(t *testing.T) {
+	tests := []struct {
+		name   string
+		server *ServerToProcess
+		want   string
+	}{
+		{
+			name:   "SID and port",
+			server: &ServerToProcess{ComputerSID: "S-1-5-21-1", Port: 1433},
+			want:   "S-1-5-21-1:1433",
+		},
+		{
+			name:   "SID and named instance",
+			server: &ServerToProcess{ComputerSID: "S-1-5-21-1", InstanceName: "SQLEXPRESS", Port: 1433},
+			want:   "S-1-5-21-1:SQLEXPRESS",
+		},
+		{
+			name:   "default instance name uses the port",
+			server: &ServerToProcess{ComputerSID: "S-1-5-21-1", InstanceName: "MSSQLSERVER", Port: 1433},
+			want:   "S-1-5-21-1:1433",
+		},
+		{
+			name:   "hostname when no SID is known",
+			server: &ServerToProcess{Hostname: "SQL01", Port: 1433},
+			want:   "sql01:1433",
+		},
+		{
+			name:   "Windows Internal Database gets its own identity",
+			server: &ServerToProcess{ComputerSID: "S-1-5-21-1", InstanceName: "MICROSOFT##WID", Port: 1433},
+			want:   "S-1-5-21-1:MICROSOFT##WID",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Collector{config: &Config{}}
+			c.assignObjectIdentifier(tc.server)
+			if tc.server.ObjectIdentifier != tc.want {
+				t.Errorf("ObjectIdentifier = %q, want %q", tc.server.ObjectIdentifier, tc.want)
+			}
+		})
+	}
+}

@@ -22,6 +22,7 @@ import (
 	"github.com/SpecterOps/MSSQLHound/internal/bloodhound"
 	"github.com/SpecterOps/MSSQLHound/internal/logging"
 	"github.com/SpecterOps/MSSQLHound/internal/mssql"
+	"github.com/SpecterOps/MSSQLHound/internal/mssql/nptransport"
 	"github.com/SpecterOps/MSSQLHound/internal/proxydialer"
 	"github.com/SpecterOps/MSSQLHound/internal/types"
 	"github.com/SpecterOps/MSSQLHound/internal/uploader"
@@ -77,6 +78,16 @@ type Config struct {
 
 	// Proxy
 	ProxyAddr string // SOCKS5 proxy address for tunneling all traffic
+
+	// NamedPipe enables the SMB named-pipe fallback transport, which reaches
+	// instances whose TCP port is closed and Windows Internal Database, neither of
+	// which is collectable otherwise.
+	NamedPipe bool
+	// NamedPipePath overrides pipe discovery with an explicit path under IPC$.
+	NamedPipePath string
+	// SMBCredentials authenticate the SMB session that opens the pipe. Separate
+	// from the SQL credentials, which authenticate the database session.
+	SMBCredentials nptransport.AuthConfig
 
 	// Logging
 	Logger       *slog.Logger
@@ -137,6 +148,11 @@ type ServerToProcess struct {
 	DiscoveredFrom   string // Hostname of server this was discovered from (for linked servers)
 	Domain           string // Domain inferred from the source server (for linked servers)
 	SkipIfUnresolved bool   // Drop scan-all-computers targets when DNS resolution fails
+	// SkipNamedPipe suppresses the named-pipe fallback for this entry. Set on all
+	// but the first port when --scan-all-computers expands one host into several
+	// targets, since every one of them would otherwise fall back to the same pipe
+	// and collect the same instance repeatedly.
+	SkipNamedPipe bool
 }
 
 type domainComputer struct {
@@ -328,6 +344,9 @@ func (c *Collector) newMSSQLClient(serverInstance, userID, password string, log 
 	}
 	if c.config.UseKerberos {
 		client.SetKerberosConfig(c.config.Krb5ConfigFile, c.config.Krb5CCacheFile, c.config.Krb5KeytabFile, c.config.Krb5Realm)
+	}
+	if c.config.NamedPipe {
+		client.SetNamedPipe(true, c.config.NamedPipePath, c.config.SMBCredentials)
 	}
 	client.SetPortCheckTimeout(c.config.PortCheckTimeout)
 	return client
@@ -702,7 +721,7 @@ func (c *Collector) scanAllComputerServers(computer domainComputer) []*ServerToP
 	ports := c.scanAllComputerPorts()
 	servers := make([]*ServerToProcess, 0, len(ports))
 	useDefaultConnectionString := len(ports) == 1 && ports[0] == 1433
-	for _, port := range ports {
+	for i, port := range ports {
 		connectionString := computer.Hostname
 		if !useDefaultConnectionString {
 			connectionString = fmt.Sprintf("%s:%d", computer.Hostname, port)
@@ -711,6 +730,8 @@ func (c *Collector) scanAllComputerServers(computer domainComputer) []*ServerToP
 		server.Port = port
 		server.ComputerSID = computer.SID
 		server.SkipIfUnresolved = true
+		// One pipe per host, not one per scanned port.
+		server.SkipNamedPipe = i > 0
 		servers = append(servers, server)
 	}
 	return servers
@@ -740,24 +761,59 @@ func (c *Collector) extractLineCredentials(line string) string {
 	return target
 }
 
-// addServerToProcess adds a server to the processing list, deduplicating by ObjectIdentifier
-func (c *Collector) addServerToProcess(server *ServerToProcess) {
-	// Build ObjectIdentifier if we have a SID
-	if server.ComputerSID != "" {
-		if server.InstanceName != "" && server.InstanceName != "MSSQLSERVER" {
-			server.ObjectIdentifier = fmt.Sprintf("%s:%s", server.ComputerSID, server.InstanceName)
-		} else {
-			server.ObjectIdentifier = fmt.Sprintf("%s:%d", server.ComputerSID, server.Port)
-		}
-	} else {
-		// Use hostname-based identifier if no SID
-		hostname := strings.ToLower(server.Hostname)
-		if server.InstanceName != "" && server.InstanceName != "MSSQLSERVER" {
-			server.ObjectIdentifier = fmt.Sprintf("%s:%s", hostname, server.InstanceName)
-		} else {
-			server.ObjectIdentifier = fmt.Sprintf("%s:%d", hostname, server.Port)
+// applyNamedPipeIdentity corrects a target's identity when the pipe that
+// answered belongs to a different instance than the one we set out to reach.
+//
+// Pipe discovery falls through from the default instance to Windows Internal
+// Database, so a host with no ordinary SQL Server can still answer — as a
+// genuinely different instance. Recording it under the host's default-instance
+// identity would attribute WSUS or AD FS data to a server that does not exist,
+// and would collide with any real default instance found later. The instance is
+// not knowable until the pipe opens, so the correction has to happen here rather
+// than while the target list is being built.
+func (c *Collector) applyNamedPipeIdentity(server *ServerToProcess, client *mssql.Client, log *slog.Logger) {
+	res, ok := client.NamedPipeResult()
+	if !ok || res.Instance == "" || strings.EqualFold(res.Instance, server.InstanceName) {
+		return
+	}
+
+	previous := server.ObjectIdentifier
+	server.InstanceName = res.Instance
+	c.assignObjectIdentifier(server)
+
+	// Keep the original identity if something already claimed the new one, rather
+	// than silently overwriting another target's output.
+	for _, existing := range c.serversToProcess {
+		if existing != server && existing.ObjectIdentifier == server.ObjectIdentifier {
+			log.Warn("Named pipe instance collides with an existing target, keeping the original identity",
+				"pipe", res.PipePath, "instance", res.Instance)
+			server.ObjectIdentifier = previous
+			return
 		}
 	}
+
+	log.Info("Connected to a different instance over the named pipe, updating identity",
+		"pipe", res.PipePath, "instance", res.Instance, "object_identifier", server.ObjectIdentifier)
+}
+
+// assignObjectIdentifier derives a server's ObjectIdentifier from its SID (or
+// hostname) plus its instance name or port.
+func (c *Collector) assignObjectIdentifier(server *ServerToProcess) {
+	base := server.ComputerSID
+	if base == "" {
+		base = strings.ToLower(server.Hostname)
+	}
+	if server.InstanceName != "" && server.InstanceName != "MSSQLSERVER" {
+		server.ObjectIdentifier = fmt.Sprintf("%s:%s", base, server.InstanceName)
+		return
+	}
+	server.ObjectIdentifier = fmt.Sprintf("%s:%d", base, server.Port)
+}
+
+// addServerToProcess adds a server to the processing list, deduplicating by ObjectIdentifier
+func (c *Collector) addServerToProcess(server *ServerToProcess) {
+	// Build ObjectIdentifier from the SID when known, hostname otherwise
+	c.assignObjectIdentifier(server)
 
 	// Check for duplicates
 	for _, existing := range c.serversToProcess {
@@ -1460,6 +1516,9 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 	client.SetVerbose(c.config.Verbose)
 	client.SetDebug(c.config.Debug)
 	client.SetCollectFromLinkedServers(c.config.CollectFromLinkedServers)
+	if server.SkipNamedPipe {
+		client.SetNamedPipe(false, "", nptransport.AuthConfig{})
+	}
 
 	// Quick port check before attempting EPA or authentication
 	if err := client.CheckPort(ctx); err != nil {
@@ -1635,6 +1694,8 @@ connected:
 	defer client.Close()
 
 	c.config.Logger.Log(context.Background(), logging.LevelVerbose, "Successfully connected", "target", server.ConnectionString)
+
+	c.applyNamedPipeIdentity(server, client, log)
 
 	// Collect server information
 	serverInfo, err := client.CollectServerInfo(ctx)

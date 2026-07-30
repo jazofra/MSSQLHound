@@ -180,6 +180,7 @@ All TCP connections support SOCKS5 proxy tunneling (`--proxy`). TLS connections 
 | Protocol | Port | Transport | Target | Purpose | Conditions |
 |----------|------|-----------|--------|---------|------------|
 | TDS (SQL Server) | 1433/tcp (default, configurable) | TCP with optional TLS | Each SQL Server being enumerated | SQL authentication and query execution | Always (core functionality) |
+| TDS over SMB named pipe | 445/tcp | SMB2/3 (signed, optionally encrypted) | Each SQL Server being enumerated | Same as TDS, when the SQL Server port is unreachable | **Only with `--named-pipe`.** |
 | SQL Browser | 1434/udp | UDP | SQL Server host | Named instance port resolution | Only for named instances without an explicit port. **Not proxied through SOCKS5.** |
 | LDAPS | 636/tcp | TLS | Domain controller | SPN enumeration, principal/SID resolution, computer enumeration | First LDAP method attempted |
 | LDAP + StartTLS | 389/tcp | TCP upgraded to TLS | Domain controller | Same as LDAPS | Fallback if LDAPS fails |
@@ -471,7 +472,50 @@ All network traffic (SQL connections, LDAP queries, EPA tests) can be tunneled t
 ./mssqlhound --scan-all-computers --proxy 127.0.0.1:1080 --dc 10.0.0.1
 ```
 
-**Note:** SQL Browser (UDP) resolution is not supported through SOCKS5 proxies. Named instances must include explicit ports (e.g., `sql.contoso.com\INSTANCE:1433`).
+**Note:** SQL Browser (UDP) resolution is not supported through SOCKS5 proxies. Named instances must include explicit ports (e.g., `sql.contoso.com\INSTANCE:1433`) — or use `--named-pipe`, which does not consult the SQL Browser at all.
+
+### Named Pipe Transport
+
+SQL Server can be reached over an SMB named pipe instead of TCP. This finds two kinds of instance that are otherwise uncollectable:
+
+- Instances with **TCP/IP disabled** in SQL Server Configuration Manager. They appear in the graph as partial, SPN-only nodes today.
+- **Windows Internal Database** (the engine behind WSUS and AD FS), which has no TCP endpoint at all.
+
+```bash
+# Fall back to a named pipe when the SQL Server port is unreachable
+./mssqlhound -t sql.contoso.com --named-pipe -u "CONTOSO\analyst" -p "password"
+
+# Separate identities for SMB and SQL
+./mssqlhound -t sql.contoso.com --named-pipe \
+  --smb-user "CONTOSO\analyst" --smb-password "password" \
+  -u sa -p "sql-password"
+
+# Pass-the-hash for the SMB session
+./mssqlhound -t sql.contoso.com --named-pipe --smb-user "CONTOSO\analyst" \
+  --smb-hash 0123456789abcdef0123456789abcdef
+
+# Windows Internal Database (requires local administrator on the target)
+./mssqlhound -t wsus.contoso.com --named-pipe -k \
+  --named-pipe-path "MICROSOFT##WID\tsql\query"
+
+# Through a SOCKS5 proxy
+./mssqlhound -t sql.contoso.com --named-pipe -x 127.0.0.1:1080 -u "CONTOSO\analyst" -p pw
+```
+
+How it behaves:
+
+- **Opt-in.** Without `--named-pipe`, nothing changes: no SMB traffic is generated and the TCP path is byte-for-byte identical to before.
+- **Fallback, not replacement.** Each target tries TCP first. The pipe is used only when the SQL Server port does not answer but 445 does.
+- **Two authentication layers.** SMB authenticates opening the pipe; SQL Server then performs its own login over it. The identities may differ, which is what the `--smb-*` flags are for. They default to `--ldap-user`/`--ldap-password`, then `--user`/`--password`.
+- **Kerberos uses one TGT.** The SMB session requests a `cifs/HOST` ticket and the database session an `MSSQLSvc/...` ticket, both from the same login.
+- **Pipe discovery.** The default instance pipe (`sql\query`) is tried first, then the Windows Internal Database pipe. A named instance uses `MSSQL$<INSTANCE>\sql\query`. `--named-pipe-path` overrides discovery for relocated pipes.
+
+Limitations:
+
+- **TDS 8.0 strict encryption cannot work over a named pipe.** It wraps the raw socket in TLS before any TDS is exchanged, and a pipe has no equivalent stage. Instances that mandate strict encryption are reported and left to the TCP path. Unencrypted and TLS-in-TDS both work normally.
+- **Windows Internal Database generally requires local administrator** on the target. Access denied on the WID pipe is an expected result for an unprivileged principal, not an error in the tool.
+- **`--scan-all-computers --named-pipe` is loud.** It adds a TCP 445 connection to every computer in the domain, plus a full SMB session setup on the ones that answer. Only the first scanned port per host attempts the pipe, so multi-port scans do not multiply the SMB traffic.
+- SMB logon failures count toward Active Directory account lockout exactly as SQL logins do. The collector stops on the first rejection for that target.
 
 ### Credential Fallback
 

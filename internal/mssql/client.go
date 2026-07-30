@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/SpecterOps/MSSQLHound/internal/logging"
+	"github.com/SpecterOps/MSSQLHound/internal/mssql/nptransport"
 	"github.com/SpecterOps/MSSQLHound/internal/types"
+	krb5client "github.com/jcmturner/gokrb5/v8/client"
 	mssqldb "github.com/microsoft/go-mssqldb"
 	"github.com/microsoft/go-mssqldb/integratedauth"
 	_ "github.com/microsoft/go-mssqldb/integratedauth/krb5" // Register Kerberos auth provider (fallback)
@@ -372,6 +374,23 @@ type Client struct {
 	proxyDialer              interface {
 		DialContext(ctx context.Context, network, address string) (net.Conn, error)
 	}
+
+	// Named pipe transport. When namedPipe is set, a target whose TCP port is
+	// unreachable is retried over an SMB named pipe. Off by default, so ordinary
+	// runs behave exactly as they did before this option existed.
+	namedPipe     bool
+	namedPipePath string                 // explicit pipe path, overriding discovery
+	smbAuth       nptransport.AuthConfig // credentials for the SMB session
+	npParams      *nptransport.Params    // retained so callers can read which pipe answered
+	smbKrb5Client *krb5client.Client     // Kerberos client for the SMB session, released by Close
+
+	// Reachability observed by CheckPort, consulted by Connect to decide which
+	// transports are worth attempting. reachChecked distinguishes "probed and
+	// found unreachable" from "never probed": not every caller runs CheckPort
+	// first, and those callers must still get a connection attempt.
+	reachChecked bool
+	reachTCP     bool
+	reachSMB     bool
 }
 
 // NewClient creates a new SQL Server client
@@ -437,13 +456,47 @@ func (c *Client) Connect(ctx context.Context) error {
 	return c.connectNative(ctx)
 }
 
-// CheckPort performs a quick TCP connectivity check against the SQL Server port.
-// Call this before EPA testing or authentication to skip unreachable servers fast.
+// CheckPort performs a quick connectivity check before EPA testing or
+// authentication, so unreachable servers are skipped fast.
+//
+// With the named-pipe transport disabled this is exactly a TCP check against the
+// SQL Server port, unchanged. With it enabled, SMB (445) is probed as a second
+// signal, because an instance reachable only by named pipes is by definition
+// unreachable on its TCP port — without this the fallback could never be tried,
+// since the collector abandons a target whose port check fails.
 func (c *Client) CheckPort(ctx context.Context) error {
+	tcpErr := c.checkTCPPort(ctx)
+	if !c.namedPipe {
+		return tcpErr
+	}
+
+	c.reachChecked = true
+	c.reachTCP = tcpErr == nil
+	if tcpErr != nil {
+		c.logVerbose("SQL Server TCP port unreachable, probing SMB", "error", tcpErr)
+	}
+
+	smbErr := c.checkSMBPort(ctx)
+	c.reachSMB = smbErr == nil
+
+	if c.reachTCP || c.reachSMB {
+		return nil
+	}
+	return fmt.Errorf("neither the SQL Server port nor SMB is reachable on %s: %w",
+		c.hostname, errors.Join(tcpErr, smbErr))
+}
+
+// checkTCPPort is the original port check: resolve the instance port if needed,
+// then open and immediately close a TCP connection.
+func (c *Client) checkTCPPort(ctx context.Context) error {
 	port := c.port
 	if port == 0 && c.instanceName != "" {
 		resolvedPort, err := c.resolveInstancePort(ctx)
 		if err != nil {
+			// The SQL Browser is UDP, so this fails outright behind a SOCKS5
+			// proxy. Returning the error here is not fatal when named pipes are
+			// enabled: CheckPort treats it as the TCP result and goes on to probe
+			// SMB, and the pipe path does not need the browser at all.
 			return fmt.Errorf("port check: failed to resolve instance port: %w", err)
 		}
 		port = resolvedPort
@@ -453,28 +506,7 @@ func (c *Client) CheckPort(ctx context.Context) error {
 		port = 1433
 	}
 
-	addr := fmt.Sprintf("%s:%d", c.hostname, port)
-
-	portCheckTimeout := c.portCheckTimeout
-	if portCheckTimeout <= 0 {
-		portCheckTimeout = 2 * time.Second
-	}
-
-	dialCtx, dialCancel := context.WithTimeout(ctx, portCheckTimeout)
-	defer dialCancel()
-
-	var conn net.Conn
-	var err error
-	if c.proxyDialer != nil {
-		dialAddr, resolveErr := resolveForProxy(dialCtx, c.hostname, port)
-		if resolveErr != nil {
-			dialAddr = addr
-		}
-		conn, err = c.proxyDialer.DialContext(dialCtx, "tcp", dialAddr)
-	} else {
-		dialer := dialerWithResolver(c.dnsResolver, portCheckTimeout)
-		conn, err = dialer.DialContext(dialCtx, "tcp", addr)
-	}
+	conn, err := c.dialTCP(ctx, c.hostname, port, c.effectivePortCheckTimeout())
 	if err != nil {
 		return fmt.Errorf("port %d not reachable on %s: %w", port, c.hostname, err)
 	}
@@ -482,8 +514,103 @@ func (c *Client) CheckPort(ctx context.Context) error {
 	return nil
 }
 
-// connectNative tries to connect using go-mssqldb
+// smbProbePort is the port used to reach SMB. It is a variable rather than a
+// constant so tests can point it at a loopback listener.
+var smbProbePort = nptransport.DefaultPort
+
+// checkSMBPort reports whether the SMB port answers, which is the prerequisite
+// for the named-pipe transport.
+func (c *Client) checkSMBPort(ctx context.Context) error {
+	conn, err := c.dialTCP(ctx, c.hostname, smbProbePort, c.effectivePortCheckTimeout())
+	if err != nil {
+		return fmt.Errorf("SMB port %d not reachable on %s: %w", smbProbePort, c.hostname, err)
+	}
+	conn.Close()
+	return nil
+}
+
+func (c *Client) effectivePortCheckTimeout() time.Duration {
+	if c.portCheckTimeout > 0 {
+		return c.portCheckTimeout
+	}
+	return 2 * time.Second
+}
+
+// dialTCP opens a TCP connection honouring the configured proxy and DNS resolver.
+//
+// This is the single place those two concerns are handled, and it is shared with
+// the named-pipe transport (which receives it as Params.Dial) so that proxy and
+// resolver behaviour cannot drift between the two paths.
+func (c *Client) dialTCP(ctx context.Context, host string, port int, timeout time.Duration) (net.Conn, error) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	if c.proxyDialer != nil {
+		// A SOCKS5 proxy resolves names in its own network, but the rest of this
+		// tool resolves against a chosen DNS server, so pre-resolve for parity.
+		dialAddr, resolveErr := resolveForProxy(dialCtx, host, port)
+		if resolveErr != nil {
+			dialAddr = addr
+		}
+		return c.proxyDialer.DialContext(dialCtx, "tcp", dialAddr)
+	}
+
+	dialer := dialerWithResolver(c.dnsResolver, timeout)
+	return dialer.DialContext(dialCtx, "tcp", addr)
+}
+
+// connectNative connects over TCP, falling back to an SMB named pipe when that
+// transport is enabled and the SQL Server port did not answer.
+//
+// The two passes are kept separate rather than merged into one protocol list
+// because they need different strategies: the pipe pass must not attempt TDS 8.0
+// strict encryption, needs a longer timeout, and should report its own errors.
 func (c *Client) connectNative(ctx context.Context) error {
+	if !c.namedPipe {
+		return c.connectTCPStrategies(ctx)
+	}
+
+	// Without a reachability probe both transports are candidates. Callers such
+	// as the collector's short-name-to-FQDN retry connect without calling
+	// CheckPort, and treating "unknown" as "unreachable" would skip them entirely.
+	tryTCP := !c.reachChecked || c.reachTCP
+	tryPipe := !c.reachChecked || c.reachSMB
+
+	var tcpErr error
+	if tryTCP {
+		tcpErr = c.connectTCPStrategies(ctx)
+		if tcpErr == nil {
+			return nil
+		}
+		// A rejected credential will be rejected over the pipe too, and retrying
+		// it would move the account closer to lockout for no benefit.
+		if IsAuthError(tcpErr) {
+			return tcpErr
+		}
+		c.logVerbose("TCP connection failed, falling back to named pipe", "error", tcpErr)
+	}
+
+	if !tryPipe {
+		if tcpErr != nil {
+			return tcpErr
+		}
+		return fmt.Errorf("no reachable transport for %s", c.hostname)
+	}
+
+	pipeErr := c.connectNamedPipe(ctx)
+	if pipeErr == nil {
+		return nil
+	}
+	if tcpErr != nil {
+		return fmt.Errorf("TCP and named pipe both failed: %w", errors.Join(tcpErr, pipeErr))
+	}
+	return pipeErr
+}
+
+// connectTCPStrategies tries to connect using go-mssqldb over TCP.
+func (c *Client) connectTCPStrategies(ctx context.Context) error {
 	// Auto-generate krb5.conf for Kerberos if needed
 	if c.useKerberos && c.krb5ConfigFile == "" {
 		// Check if default config exists (KRB5_CONFIG env or /etc/krb5.conf)
@@ -817,6 +944,220 @@ func (c *Client) connectNative(ctx context.Context) error {
 	return fmt.Errorf("all connection strategies failed, last error: %w", lastErr)
 }
 
+// npStrategies are the encryption modes attempted over a named pipe, in order.
+//
+// Deliberately short. "strict" is absent and must stay absent: TDS 8.0 strict
+// encryption negotiates TLS on the raw socket before any TDS is exchanged, and a
+// named pipe has no equivalent stage, so it cannot work by construction. The
+// short-hostname variants used by the TCP path are absent too, since they exist
+// to correct Kerberos SPN mismatches and the pipe transport sets its SPN
+// explicitly.
+var npStrategies = []string{"true", "false"}
+
+// npPingTimeout is the per-attempt budget for the named-pipe pass.
+//
+// Much larger than the 10s the TCP path uses, because far more happens before a
+// connection is usable: SMB negotiate, session setup, tree connect, pipe open,
+// TDS prelogin, optional TLS-in-TDS, then LOGIN7. Through a SOCKS5 proxy to a
+// busy host that does not fit in 10s.
+const npPingTimeout = 30 * time.Second
+
+// npDialTimeout bounds the SMB setup portion of a single attempt.
+const npDialTimeout = 20 * time.Second
+
+// connectNamedPipe connects to SQL Server over an SMB named pipe.
+func (c *Client) connectNamedPipe(ctx context.Context) error {
+	// Detected up front and reported rather than retried: no strategy can satisfy
+	// a server that demands TDS 8.0 over a transport that cannot carry it.
+	if c.epaResult != nil && c.epaResult.StrictEncryption {
+		return fmt.Errorf("%w (server requires strict encryption; use TCP for this instance)",
+			nptransport.ErrStrictEncryptionUnsupported)
+	}
+
+	params := c.newNamedPipeParams()
+	c.npParams = params
+
+	var lastErr error
+	for _, encrypt := range npStrategies {
+		connStr := c.buildNamedPipeConnectionString(encrypt)
+		c.logVerbose("Trying named pipe connection", "host", c.hostname, "encrypt", encrypt)
+
+		config, err := msdsn.Parse(connStr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Force this Config onto the pipe transport and hand it the per-target
+		// state. Protocols is set here rather than by a registered parser so that
+		// every other connection in the process is unaffected.
+		config.Protocols = []string{nptransport.Protocol}
+		if config.ProtocolParameters == nil {
+			config.ProtocolParameters = map[string]any{}
+		}
+		config.ProtocolParameters[nptransport.Protocol] = params
+		config.DialTimeout = npDialTimeout
+
+		if c.useKerberos {
+			integratedauth.SetIntegratedAuthenticationProvider(krb5CustomProviderName, &krb5CustomProvider{
+				krb5ConfigFile: c.krb5ConfigFile,
+				krb5CCacheFile: c.krb5CCacheFile,
+				krb5KeytabFile: c.krb5KeytabFile,
+				krb5Realm:      c.krb5Realm,
+				logger:         c.logger,
+				verbose:        c.verbose,
+			})
+			config.Parameters["authenticator"] = krb5CustomProviderName
+		}
+
+		connector := mssqldb.NewConnectorConfig(config)
+		// connector.Dialer is intentionally left unset. It is unreachable from a
+		// ProtocolDialer, which receives only the Config; the proxy travels in
+		// Params.Dial instead.
+		db := sql.OpenDB(connector)
+		// Each pooled connection means another SMB session, session setup and
+		// service ticket, so keep exactly one.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+
+		pingCtx, cancel := context.WithTimeout(ctx, npPingTimeout)
+		err = db.PingContext(pingCtx)
+		cancel()
+
+		if err != nil {
+			db.Close()
+			lastErr = err
+			c.logVerbose("Named pipe connection failed", "encrypt", encrypt, "error", err)
+			// An SMB rejection is terminal for the same reason a SQL one is: the
+			// credential is wrong, and repeating it advances account lockout.
+			if IsAuthError(err) {
+				c.logVerbose("Authentication error over named pipe, not retrying")
+				break
+			}
+			// A missing pipe or a denied ACL will not change with encryption.
+			if errors.Is(err, nptransport.ErrPipeNotFound) ||
+				errors.Is(err, nptransport.ErrPipeAccessDenied) ||
+				errors.Is(err, nptransport.ErrSMBUnreachable) {
+				break
+			}
+			continue
+		}
+
+		res := params.Result()
+		c.logVerbose("Named pipe connection succeeded",
+			"pipe", res.PipePath, "encrypt", encrypt, "smb_auth", res.SMBAuth)
+		c.db = db
+		return nil
+	}
+
+	if lastErr == nil {
+		lastErr = nptransport.ErrPipeNotFound
+	}
+	return fmt.Errorf("named pipe connection failed: %w", lastErr)
+}
+
+// newNamedPipeParams assembles the per-target state for the pipe transport.
+func (c *Client) newNamedPipeParams() *nptransport.Params {
+	candidates := nptransport.Candidates(c.instanceName)
+	if c.namedPipePath != "" {
+		// An explicit path is an escape hatch for relocated or unusual pipes, so
+		// it replaces discovery rather than extending it.
+		candidates = []string{c.namedPipePath}
+	}
+
+	auth := c.smbAuth
+	if auth.SMBSPN == "" {
+		auth.SMBSPN = nptransport.SMBSPNFor(c.hostname)
+	}
+
+	// Kerberos for SMB reuses the client's own credentials unless the caller
+	// supplied a separate one. Building it here rather than in the transport keeps
+	// credential handling in a single place, and gokrb5 will fetch the cifs/ ticket
+	// from the same TGT that the TDS layer uses for MSSQLSvc/.
+	if c.useKerberos && auth.Krb5Client == nil {
+		if c.smbKrb5Client == nil {
+			krbClient, err := newKrb5Client(krb5ClientOptions{
+				ConfigFile: c.krb5ConfigFile,
+				CCacheFile: c.krb5CCacheFile,
+				KeytabFile: c.krb5KeytabFile,
+				Realm:      c.krb5Realm,
+				User:       c.userID,
+				Password:   c.password,
+			}, c.logger, c.verbose)
+			if err != nil {
+				// Not fatal on its own: NTLM credentials may still be configured,
+				// and if they are not the transport reports the missing identity.
+				c.logVerbose("Could not build Kerberos client for SMB", "error", err)
+			} else {
+				c.smbKrb5Client = krbClient
+			}
+		}
+		auth.Krb5Client = c.smbKrb5Client
+	}
+
+	return &nptransport.Params{
+		Host:           c.hostname,
+		Port:           smbProbePort,
+		PipeCandidates: candidates,
+		Auth:           auth,
+		TDSSPN:         c.serverSPNForTDS(),
+		Logger:         c.logger,
+		Dial: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+			host, portStr, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			port, err := strconv.Atoi(portStr)
+			if err != nil {
+				return nil, err
+			}
+			return c.dialTCP(dialCtx, host, port, npDialTimeout)
+		},
+	}
+}
+
+// serverSPNForTDS builds the MSSQLSvc SPN for the database session, which is
+// distinct from the cifs/ SPN used to authenticate the SMB session.
+func (c *Client) serverSPNForTDS() string {
+	if c.instanceName != "" && c.instanceName != "MSSQLSERVER" {
+		return fmt.Sprintf("MSSQLSvc/%s:%s", c.hostname, c.instanceName)
+	}
+	port := c.port
+	if port == 0 {
+		port = 1433
+	}
+	return fmt.Sprintf("MSSQLSvc/%s:%d", c.hostname, port)
+}
+
+// buildNamedPipeConnectionString builds a connection string for the pipe pass.
+//
+// No port is emitted: the transport reaches the instance through its pipe name,
+// so a TCP port would be meaningless. No instance is emitted either, because
+// go-mssqldb would treat it as a request to consult the SQL Browser, which the
+// pipe transport deliberately never does.
+func (c *Client) buildNamedPipeConnectionString(encrypt string) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "server=%s;", c.hostname)
+
+	switch {
+	case c.useKerberos:
+		b.WriteString("trusted_connection=yes;")
+		if c.userID != "" {
+			fmt.Fprintf(&b, "user id=%s;", c.userID)
+		}
+		fmt.Fprintf(&b, "ServerSPN=%s;", c.serverSPNForTDS())
+	case c.useWindowsAuth:
+		b.WriteString("trusted_connection=yes;")
+		fmt.Fprintf(&b, "ServerSPN=%s;", c.serverSPNForTDS())
+	default:
+		fmt.Fprintf(&b, "user id=%s;password=%s;", c.userID, c.password)
+	}
+
+	fmt.Fprintf(&b, "encrypt=%s;TrustServerCertificate=true;app name=MSSQLHound", encrypt)
+	return b.String()
+}
+
 // executeQuery returns query results as []QueryResult for uniform processing.
 func (c *Client) executeQuery(ctx context.Context, query string) ([]QueryResult, error) {
 	rows, err := c.DBW().QueryContext(ctx, query)
@@ -1012,6 +1353,37 @@ func (c *Client) SetProxyDialer(d interface {
 // When set, collectEncryptionSettings will use this instead of running EPA tests.
 func (c *Client) SetEPAResult(result *EPATestResult) {
 	c.epaResult = result
+}
+
+// SetNamedPipe enables the SMB named-pipe fallback transport.
+//
+// pipePath, when non-empty, overrides pipe discovery and is used verbatim
+// (relative to IPC$). auth supplies the SMB session credentials, which are
+// deliberately independent of the SQL credentials: SMB authenticates opening the
+// pipe, and TDS then performs its own login over it.
+func (c *Client) SetNamedPipe(enabled bool, pipePath string, auth nptransport.AuthConfig) {
+	c.namedPipe = enabled
+	c.namedPipePath = pipePath
+	c.smbAuth = auth
+}
+
+// NamedPipeResult reports which pipe answered, and is only meaningful after a
+// connection succeeded over the named-pipe transport. The second return value is
+// false when the connection did not use a named pipe.
+//
+// Callers need this because the pipe that answers is not always the one implied
+// by the target: when a host has no default SQL pipe, discovery falls through to
+// the Windows Internal Database pipe, which is a genuinely different instance and
+// must be recorded under its own identity.
+func (c *Client) NamedPipeResult() (nptransport.Result, bool) {
+	if c.npParams == nil {
+		return nptransport.Result{}, false
+	}
+	res := c.npParams.Result()
+	if res.PipePath == "" {
+		return nptransport.Result{}, false
+	}
+	return res, true
 }
 
 // SetLogger sets the structured logger for the client.
@@ -1425,6 +1797,12 @@ func boolToSuccessFail(b bool) string {
 
 // Close closes the database connection
 func (c *Client) Close() error {
+	// The SMB Kerberos client holds a TGT and its own resources, and is created
+	// per target rather than shared, so it is released here.
+	if c.smbKrb5Client != nil {
+		c.smbKrb5Client.Destroy()
+		c.smbKrb5Client = nil
+	}
 	if c.db != nil {
 		return c.db.Close()
 	}
