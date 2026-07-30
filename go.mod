@@ -20,6 +20,9 @@ require (
 	github.com/alexbrainman/sspi v0.0.0-20210105120005-909beea2cc74 // indirect
 	github.com/bodgit/ntlmssp v0.0.0-20240506230425-31973bb52d9b // indirect
 	github.com/bodgit/windows v1.0.1 // indirect
+	github.com/cloudsoda/go-smb2 v0.0.0-20260725063021-373e9530b9d6 // indirect
+	github.com/cloudsoda/sddl v0.0.0-20250224235906-926454e91efc // indirect
+	github.com/geoffgarside/ber v1.1.0 // indirect
 	github.com/go-asn1-ber/asn1-ber v1.5.5 // indirect
 	github.com/go-logr/logr v1.4.1 // indirect
 	github.com/gofrs/uuid v4.4.0+incompatible // indirect
