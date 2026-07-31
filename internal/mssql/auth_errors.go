@@ -1,6 +1,10 @@
 package mssql
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/SpecterOps/MSSQLHound/internal/mssql/nptransport"
+)
 
 // QueryResult represents a row of query results.
 type QueryResult map[string]interface{}
@@ -10,6 +14,12 @@ type QueryResult map[string]interface{}
 func IsAuthError(err error) bool {
 	if err == nil {
 		return false
+	}
+	// SMB session-setup rejections count toward lockout exactly as SQL logins do.
+	// A sweep that authenticates to many hosts must stop on the first rejection,
+	// so the named-pipe transport's classification has to be consulted here too.
+	if nptransport.IsAuthError(err) {
+		return true
 	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "login failed") ||

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/SpecterOps/MSSQLHound/internal/collector"
 	"github.com/SpecterOps/MSSQLHound/internal/logging"
+	"github.com/SpecterOps/MSSQLHound/internal/mssql/nptransport"
 	"github.com/SpecterOps/MSSQLHound/internal/proxydialer"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -39,7 +41,16 @@ var (
 	debug          bool
 	proxyAddr      string
 
+	// SMB session credentials for the named-pipe transport. SMB authenticates
+	// opening the pipe and SQL Server then authenticates the database session, so
+	// the two identities are allowed to differ.
+	smbUser     string
+	smbPassword string
+	smbHash     string
+
 	// Collection-specific options (local to root command)
+	namedPipe     bool
+	namedPipePath string
 	tempDir       string
 	zipDir        string
 	fileSizeLimit string
@@ -118,6 +129,9 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	rootCmd.PersistentFlags().StringVar(&krb5CCacheFile, "krb5-credcachefile", "", "Path to Kerberos credential cache file (overrides KRB5CCNAME env var)")
 	rootCmd.PersistentFlags().StringVar(&krb5KeytabFile, "krb5-keytabfile", "", "Path to Kerberos keytab file")
 	rootCmd.PersistentFlags().StringVar(&krb5Realm, "krb5-realm", "", "Kerberos realm (default: derived from domain or krb5.conf)")
+	rootCmd.PersistentFlags().StringVar(&smbUser, "smb-user", "", "Username for the SMB session used by --named-pipe (default: --ldap-user, then --user)")
+	rootCmd.PersistentFlags().StringVar(&smbPassword, "smb-password", "", "Password for --smb-user (default: --ldap-password, then --password)")
+	rootCmd.PersistentFlags().StringVar(&smbHash, "smb-hash", "", "NT hash for SMB pass-the-hash (32 hex chars; default: --nt-hash)")
 	rootCmd.PersistentFlags().StringVarP(&domain, "domain", "d", "", "Domain to use for name and SID resolution")
 	rootCmd.PersistentFlags().StringVar(&dc, "dc", "", "Domain controller hostname or IP (used for LDAP and as DNS resolver if --dns-resolver not specified)")
 	rootCmd.PersistentFlags().StringVar(&dnsResolver, "dns-resolver", "", "DNS resolver IP address for domain lookups")
@@ -140,6 +154,8 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	rootCmd.Flags().BoolVar(&disablePossibleEdges, "disable-possible-edges", false, "Disable possible edges (makes them non-traversable in schema and edge data)")
 	rootCmd.Flags().BoolVar(&skipIPDedupe, "skip-ip-dedupe", false, "Skip DNS-based target deduplication (keeps all targets even if they resolve to the same IP)")
 	rootCmd.Flags().StringVar(&scanAllComputerPorts, "scan-all-computer-ports", "1433", "Comma-separated TCP ports to scan for --scan-all-computers targets")
+	rootCmd.Flags().BoolVar(&namedPipe, "named-pipe", false, "Fall back to TDS over an SMB named pipe (TCP 445) when the SQL Server port is unreachable; also finds Windows Internal Database")
+	rootCmd.Flags().StringVar(&namedPipePath, "named-pipe-path", "", "Pipe path relative to IPC$, overriding discovery (e.g. MICROSOFT##WID\\tsql\\query)")
 	rootCmd.Flags().IntVar(&linkedServerTimeout, "linked-timeout", 300, "Linked server enumeration timeout (seconds)")
 	rootCmd.Flags().IntVar(&portCheckTimeout, "port-check-timeout", 2, "TCP port reachability timeout before skipping a target (seconds)")
 	rootCmd.Flags().IntVar(&memoryThresholdPercent, "memory-threshold", 90, "Stop when memory exceeds this percentage")
@@ -156,7 +172,8 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 
 	// Annotate flags with display groups for --help output
 	for _, name := range []string{"user", "password", "nt-hash", "ldap-user", "ldap-password",
-		"kerberos", "krb5-configfile", "krb5-credcachefile", "krb5-keytabfile", "krb5-realm"} {
+		"kerberos", "krb5-configfile", "krb5-credcachefile", "krb5-keytabfile", "krb5-realm",
+		"smb-user", "smb-password", "smb-hash"} {
 		rootCmd.PersistentFlags().SetAnnotation(name, "group", []string{"Authentication"}) //nolint:errcheck
 	}
 	for _, name := range []string{"targets", "domain", "dc", "dns-resolver", "proxy"} {
@@ -164,7 +181,8 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	}
 	for _, name := range []string{"scan-all-computers", "skip-private-address",
 		"domain-enum-only", "skip-linked-servers", "collect-from-linked",
-		"skip-ad-nodes", "disable-nontraversable-edges", "disable-possible-edges", "skip-ip-dedupe", "scan-all-computer-ports"} {
+		"skip-ad-nodes", "disable-nontraversable-edges", "disable-possible-edges", "skip-ip-dedupe", "scan-all-computer-ports",
+		"named-pipe", "named-pipe-path"} {
 		rootCmd.Flags().SetAnnotation(name, "group", []string{"Collection"}) //nolint:errcheck
 	}
 	for _, name := range []string{"linked-timeout", "workers", "file-size-limit",
@@ -398,6 +416,30 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--port-check-timeout must be greater than 0 seconds")
 	}
 
+	if smbPassword != "" && smbHash != "" {
+		return fmt.Errorf("--smb-password and --smb-hash are mutually exclusive")
+	}
+	smbCreds, err := resolveSMBCredentials()
+	if err != nil {
+		return err
+	}
+	if !namedPipe {
+		// Ignored rather than rejected, so scripted invocations that always pass
+		// SMB credentials still work when named pipes happen to be off.
+		for flag, set := range map[string]bool{
+			"--smb-user": smbUser != "", "--smb-password": smbPassword != "",
+			"--smb-hash": smbHash != "", "--named-pipe-path": namedPipePath != "",
+		} {
+			if set {
+				fmt.Fprintf(os.Stderr, "Warning: %s has no effect without --named-pipe\n", flag)
+			}
+		}
+	} else if !useKerberos && smbCreds.User == "" && len(smbCreds.NTHash) == 0 {
+		// Fail now rather than probing 445 on every target only to find there is
+		// nothing to authenticate with.
+		return fmt.Errorf("--named-pipe requires SMB credentials: set --smb-user, --ldap-user, -u, or use -k for Kerberos")
+	}
+
 	// Determine what to upload: default is both schema and results
 	uploadSchema := true
 	uploadResults := true
@@ -436,6 +478,9 @@ func run(cmd *cobra.Command, args []string) error {
 		SkipPrivateAddress:         skipPrivateAddress,
 		ScanAllComputers:           scanAllComputers,
 		ScanAllComputerPorts:       parsedScanAllComputerPorts,
+		NamedPipe:                  namedPipe,
+		NamedPipePath:              namedPipePath,
+		SMBCredentials:             smbCreds,
 		SkipADNodeCreation:         skipADNodeCreation,
 		DisableNontraversableEdges: disableNontraversableEdges,
 		DisablePossibleEdges:       disablePossibleEdges,
@@ -488,6 +533,61 @@ func classifyTarget(target string) (string, string, string) {
 	}
 	// Otherwise it's a single server instance (host, host:port, host\instance, SPN)
 	return target, "", ""
+}
+
+// resolveSMBCredentials determines the identity used for the SMB session that
+// opens a named pipe.
+//
+// The chain prefers the dedicated --smb-* flags, then the LDAP credentials, and
+// only then the SQL login. LDAP is deliberately ahead of --user: SMB is a domain
+// authentication surface, exactly like LDAP and EPA, whereas --user is documented
+// as a SQL Server login and is frequently a local SQL account such as 'sa', which
+// cannot authenticate to SMB at all. Trying it would produce nothing but failed
+// logons against every host in scope.
+func resolveSMBCredentials() (nptransport.AuthConfig, error) {
+	auth := nptransport.AuthConfig{}
+
+	switch {
+	case smbUser != "":
+		auth.User = smbUser
+		auth.Password = smbPassword
+	case ldapUser != "":
+		auth.User = ldapUser
+		auth.Password = ldapPassword
+	default:
+		auth.User = userID
+		auth.Password = password
+	}
+
+	// An explicit --smb-password always wins, even when the username came from a
+	// fallback, so the two can be mixed.
+	if smbPassword != "" {
+		auth.Password = smbPassword
+	}
+
+	hashHex := smbHash
+	if hashHex == "" {
+		hashHex = ntHash
+	}
+	if hashHex != "" {
+		decoded, err := hex.DecodeString(hashHex)
+		if err != nil || len(decoded) != 16 {
+			return auth, fmt.Errorf("invalid SMB NT hash: must be 32 hex characters")
+		}
+		auth.NTHash = decoded
+		// Pass-the-hash replaces the password rather than supplementing it.
+		auth.Password = ""
+	}
+
+	// A qualified username carries its own domain; otherwise fall back to -d.
+	if d, account := nptransport.SplitDomainUser(auth.User); d != "" {
+		auth.Domain = d
+		auth.User = account
+	} else {
+		auth.Domain = domain
+	}
+
+	return auth, nil
 }
 
 func parsePortList(value string) ([]int, error) {

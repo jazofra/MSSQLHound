@@ -340,3 +340,121 @@ func TestParseBloodhoundUploadFlag(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveSMBCredentials covers the fallback chain for the identity that opens
+// a named pipe. The ordering matters operationally: --ldap-user precedes --user
+// because SMB is a domain authentication surface, while --user is documented as a
+// SQL Server login and is often a local account such as 'sa' that cannot
+// authenticate to SMB at all.
+func TestResolveSMBCredentials(t *testing.T) {
+	// The resolver reads package-level flag variables, so each case sets them and
+	// restores the originals afterwards.
+	save := func() func() {
+		oSmbUser, oSmbPass, oSmbHash := smbUser, smbPassword, smbHash
+		oLdapUser, oLdapPass := ldapUser, ldapPassword
+		oUser, oPass, oHash, oDomain := userID, password, ntHash, domain
+		return func() {
+			smbUser, smbPassword, smbHash = oSmbUser, oSmbPass, oSmbHash
+			ldapUser, ldapPassword = oLdapUser, oLdapPass
+			userID, password, ntHash, domain = oUser, oPass, oHash, oDomain
+		}
+	}
+
+	const validHash = "0123456789abcdef0123456789abcdef"
+
+	tests := []struct {
+		name                        string
+		smbU, smbP, smbH            string
+		ldapU, ldapP                string
+		user, pass, hash, dom       string
+		wantUser, wantPass, wantDom string
+		wantHashLen                 int
+		wantErr                     bool
+	}{
+		{
+			name: "dedicated flags win",
+			smbU: `CORP\svc`, smbP: "smbpw",
+			ldapU: `CORP\ldap`, ldapP: "ldappw",
+			user: "sa", pass: "sapw",
+			wantUser: "svc", wantPass: "smbpw", wantDom: "CORP",
+		},
+		{
+			name:  "falls back to LDAP credentials",
+			ldapU: `CORP\ldap`, ldapP: "ldappw",
+			user: "sa", pass: "sapw",
+			wantUser: "ldap", wantPass: "ldappw", wantDom: "CORP",
+		},
+		{
+			name: "falls back to SQL credentials last",
+			user: "svc", pass: "sqlpw", dom: "CORP",
+			wantUser: "svc", wantPass: "sqlpw", wantDom: "CORP",
+		},
+		{
+			name:  "UPN username splits into domain and account",
+			ldapU: "svc@corp.example", ldapP: "pw",
+			wantUser: "svc", wantPass: "pw", wantDom: "corp.example",
+		},
+		{
+			name: "unqualified username takes the -d domain",
+			smbU: "svc", smbP: "pw", dom: "CORP",
+			wantUser: "svc", wantPass: "pw", wantDom: "CORP",
+		},
+		{
+			name:  "explicit smb password overrides a fallback username's password",
+			ldapU: `CORP\ldap`, ldapP: "ldappw", smbP: "smbpw",
+			wantUser: "ldap", wantPass: "smbpw", wantDom: "CORP",
+		},
+		{
+			name: "smb hash clears the password",
+			smbU: `CORP\svc`, smbP: "", smbH: validHash,
+			wantUser: "svc", wantPass: "", wantDom: "CORP", wantHashLen: 16,
+		},
+		{
+			name: "falls back to the SQL nt-hash",
+			user: "svc", hash: validHash, dom: "CORP",
+			wantUser: "svc", wantPass: "", wantDom: "CORP", wantHashLen: 16,
+		},
+		{
+			name: "invalid hash rejected",
+			smbU: "svc", smbH: "nothex",
+			wantErr: true,
+		},
+		{
+			name: "short hash rejected",
+			smbU: "svc", smbH: "0123",
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			defer save()()
+			smbUser, smbPassword, smbHash = tc.smbU, tc.smbP, tc.smbH
+			ldapUser, ldapPassword = tc.ldapU, tc.ldapP
+			userID, password, ntHash, domain = tc.user, tc.pass, tc.hash, tc.dom
+
+			got, err := resolveSMBCredentials()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("resolveSMBCredentials() = nil error, want a failure")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveSMBCredentials() = %v", err)
+			}
+			if got.User != tc.wantUser {
+				t.Errorf("User = %q, want %q", got.User, tc.wantUser)
+			}
+			if got.Password != tc.wantPass {
+				t.Errorf("Password = %q, want %q", got.Password, tc.wantPass)
+			}
+			if got.Domain != tc.wantDom {
+				t.Errorf("Domain = %q, want %q", got.Domain, tc.wantDom)
+			}
+			if len(got.NTHash) != tc.wantHashLen {
+				t.Errorf("NTHash length = %d, want %d", len(got.NTHash), tc.wantHashLen)
+			}
+		})
+	}
+}
