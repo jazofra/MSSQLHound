@@ -587,13 +587,13 @@ export BLOODHOUND_TOKEN_KEY=<token-key>
 
 # Skip AD node creation (collect only MSSQL nodes, no User/Group/Computer nodes)
 ./mssqlhound -t sql.contoso.com --skip-ad-nodes
-```
 
 # Add non-traversable data-access edges (read/write/delete) to databases
 # Draws MSSQL_ReadDB (SELECT), MSSQL_WriteDB (INSERT/UPDATE), and MSSQL_DeleteDB
 # (DELETE) edges from principals with explicit DATABASE-scoped grants or the
 # db_datareader / db_datawriter fixed roles. Off by default.
 ./mssqlhound -t sql.contoso.com --enable-data-access-edges
+```
 
 ### Linked Server Options
 
