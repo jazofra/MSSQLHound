@@ -7,30 +7,30 @@ package mssql
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
-// generateKrb5Config creates a minimal krb5.conf in a temp file and returns its path.
+// GenerateKrb5Config creates a minimal krb5.conf in a temp file and returns its path.
 // The caller is responsible for cleaning up the file (e.g. via os.Remove or defer).
 func GenerateKrb5Config(domain, kdcAddress string) (string, error) {
-	realm := strings.ToUpper(domain)
+	return GenerateKrb5ConfigWithTrusts(domain, kdcAddress, nil, false)
+}
 
-	content := fmt.Sprintf(`[libdefaults]
-    default_realm = %s
-    dns_lookup_kdc = false
-    udp_preference_limit = 1
-
-[realms]
-    %s = {
-        kdc = %s
-    }
-
-[domain_realm]
-    .%s = %s
-    %s = %s
-`, realm, realm, kdcAddress,
-		strings.ToLower(domain), realm,
-		strings.ToLower(domain), realm)
+// GenerateKrb5ConfigWithTrusts is GenerateKrb5Config for cross-domain runs.
+//
+// Kerberos authentication to a service in a trusted domain works by
+// referral: the home KDC hands out a cross-realm TGT and the client must
+// then reach the trusted realm's KDC. A single-realm krb5.conf with
+// dns_lookup_kdc = false leaves gokrb5 no way to find that KDC, so:
+//   - every trustedKDCs entry (lower-case DNS domain -> KDC host) gets its own
+//     [realms] stanza and [domain_realm] mapping, and
+//   - dnsLookupKDC enables DNS SRV discovery for any other trusted realm.
+//
+// With nil trustedKDCs and dnsLookupKDC false the output is byte-for-byte the
+// historical single-realm file.
+func GenerateKrb5ConfigWithTrusts(domain, kdcAddress string, trustedKDCs map[string]string, dnsLookupKDC bool) (string, error) {
+	content := buildKrb5Config(domain, kdcAddress, trustedKDCs, dnsLookupKDC)
 
 	f, err := os.CreateTemp("", "mssqlhound-krb5-*.conf")
 	if err != nil {
@@ -46,4 +46,35 @@ func GenerateKrb5Config(domain, kdcAddress string) (string, error) {
 		return "", fmt.Errorf("closing temp krb5.conf: %w", err)
 	}
 	return f.Name(), nil
+}
+
+// buildKrb5Config renders the krb5.conf text (see GenerateKrb5ConfigWithTrusts).
+func buildKrb5Config(domain, kdcAddress string, trustedKDCs map[string]string, dnsLookupKDC bool) string {
+	type realmEntry struct{ dns, kdc string }
+	realms := []realmEntry{{strings.ToLower(domain), kdcAddress}}
+
+	// Deterministic order keeps the generated file stable across runs.
+	trusted := make([]string, 0, len(trustedKDCs))
+	for dns := range trustedKDCs {
+		if !strings.EqualFold(dns, domain) {
+			trusted = append(trusted, dns)
+		}
+	}
+	sort.Strings(trusted)
+	for _, dns := range trusted {
+		realms = append(realms, realmEntry{strings.ToLower(dns), trustedKDCs[dns]})
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "[libdefaults]\n    default_realm = %s\n    dns_lookup_kdc = %t\n    udp_preference_limit = 1\n\n[realms]\n",
+		strings.ToUpper(domain), dnsLookupKDC)
+	for _, r := range realms {
+		fmt.Fprintf(&b, "    %s = {\n        kdc = %s\n    }\n", strings.ToUpper(r.dns), r.kdc)
+	}
+	b.WriteString("\n[domain_realm]\n")
+	for _, r := range realms {
+		realm := strings.ToUpper(r.dns)
+		fmt.Fprintf(&b, "    .%s = %s\n    %s = %s\n", r.dns, realm, r.dns, realm)
+	}
+	return b.String()
 }

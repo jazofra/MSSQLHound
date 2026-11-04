@@ -340,3 +340,36 @@ func TestParseBloodhoundUploadFlag(t *testing.T) {
 		})
 	}
 }
+
+func TestParseDomainDCMap(t *testing.T) {
+	got, err := parseDomainDCMap(" Trusted.Local.=10.1.0.1 , partner.com = dc01.partner.com ")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := map[string]string{"trusted.local": "10.1.0.1", "partner.com": "dc01.partner.com"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("got %v, want %v", got, want)
+		}
+	}
+
+	if m, err := parseDomainDCMap("  "); err != nil || m != nil {
+		t.Fatalf("empty value: got (%v, %v), want (nil, nil)", m, err)
+	}
+
+	for _, bad := range []string{
+		"trusted.local",                    // missing =dc
+		"trusted.local=",                   // empty dc
+		"=10.1.0.1",                        // empty domain
+		"TRUSTED=10.1.0.1",                 // NetBIOS name, not DNS
+		"a.local=1.1.1.1,,b.local=2.2.2.2", // empty entry
+		"a.local=1.1.1.1,A.LOCAL.=2.2.2.2", // duplicate after normalisation
+	} {
+		if _, err := parseDomainDCMap(bad); err == nil {
+			t.Errorf("parseDomainDCMap(%q) succeeded, want error", bad)
+		}
+	}
+}

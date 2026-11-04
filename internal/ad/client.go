@@ -44,6 +44,18 @@ type Client struct {
 	// Set after a successful bind; describes transport + auth method used
 	authMethod string
 
+	// credDomain is the DNS domain the bind credentials belong to. It is only
+	// set when this client targets a domain OTHER than the credentials' own
+	// domain (a trusted domain). When empty, or equal to domain, every bind
+	// path behaves exactly as it did before cross-domain support existed.
+	credDomain string
+
+	// connectErr remembers the first Connect() failure so later lookups on the
+	// same client return immediately instead of re-binding. Re-binding with
+	// credentials that were just rejected risks AD account lockout, and
+	// re-dialing an unreachable DC costs up to 3 x 30s per call.
+	connectErr error
+
 	// Optional logger for verbose output (e.g. Kerberos ticket dumping)
 	logger *slog.Logger
 }
@@ -87,8 +99,55 @@ func (c *Client) AuthMethod() string {
 	return c.authMethod
 }
 
-// Connect establishes a connection to the domain controller
+// Connect establishes a connection to the domain controller.
+//
+// It is idempotent: an already-connected client returns nil, and a client
+// whose first attempt failed returns that same error without dialing or
+// binding again (see connectErr for why).
 func (c *Client) Connect() error {
+	if c.conn != nil {
+		return nil
+	}
+	if c.connectErr != nil {
+		return c.connectErr
+	}
+	if err := c.connect(); err != nil {
+		c.connectErr = err
+		return err
+	}
+	return nil
+}
+
+// Domain returns the DNS domain this client queries.
+func (c *Client) Domain() string {
+	return c.domain
+}
+
+// SetCredentialDomain records the DNS domain the bind credentials belong to.
+// Callers set it only when this client targets a trusted domain that differs
+// from the credentials' domain; see isCrossDomain for the effect on binds.
+func (c *Client) SetCredentialDomain(domain string) {
+	c.credDomain = domain
+}
+
+// isCrossDomain reports whether this client binds to a domain other than the
+// one its credentials belong to (i.e. authentication crosses a trust).
+func (c *Client) isCrossDomain() bool {
+	return c.credDomain != "" && !strings.EqualFold(c.credDomain, c.domain)
+}
+
+// credentialDomain is the domain used to qualify a bare --ldap-user name:
+// the credentials' own domain when binding across a trust, otherwise the
+// target domain (the historical behaviour).
+func (c *Client) credentialDomain() string {
+	if c.isCrossDomain() {
+		return c.credDomain
+	}
+	return c.domain
+}
+
+// connect performs the actual DC resolution, dial and bind.
+func (c *Client) connect() error {
 	dc := c.domainController
 	if dc == "" {
 		// Try to resolve domain controller
@@ -353,26 +412,76 @@ func containsAny(errors []string, substrings ...string) bool {
 	return false
 }
 
+// errCrossDomainNTHash is returned when an NT hash bind is attempted across a
+// trust. It deliberately does not look like an LDAP auth error (result 49), so
+// it never trips the lockout guards: the credentials were not rejected, the
+// NTLM library simply cannot express them for another domain.
+var errCrossDomainNTHash = fmt.Errorf("NTLM pass-the-hash binds across a domain trust are not supported (the NTLM library always uses the target DC's domain name); use a password or Kerberos (-k) for trusted domains")
+
 // ntlmBind performs NTLM authentication
 func (c *Client) ntlmBind(conn *ldap.Conn) error {
-	// Parse domain and username
-	domain := c.domain
-	username := c.ldapUser
-
-	if strings.Contains(username, "\\") {
-		parts := strings.SplitN(username, "\\", 2)
-		domain = parts[0]
-		username = parts[1]
-	} else if strings.Contains(username, "@") {
-		parts := strings.SplitN(username, "@", 2)
-		username = parts[0]
-		domain = parts[1]
+	domain, username, err := ntlmBindIdentity(c.ldapUser, c.domain, c.credDomain, c.isCrossDomain(), c.ntHash != "")
+	if err != nil {
+		return err
 	}
-
 	if c.ntHash != "" {
 		return conn.NTLMBindWithHash(domain, username, c.ntHash)
 	}
 	return conn.NTLMBind(domain, username, c.ldapPassword)
+}
+
+// ntlmBindIdentity decides the (domain, username) pair handed to go-ldap's
+// NTLM bind.
+//
+// Background on why cross-domain binds need special handling: go-ldap only
+// puts the domain argument into the NTLM NEGOTIATE message. The AUTHENTICATE
+// message is built by go-ntlmssp, which copies the domain from the server's
+// CHALLENGE (TargetName) whenever the username has no "@" - so "HOME\user"
+// sent to a TRUSTED DC would authenticate as "TRUSTED\user" and fail. When the
+// username is a UPN ("user@home.local"), go-ntlmssp blanks the domain instead
+// and sends the UPN as-is, which Windows resolves to the right account and
+// passes through the trust. The hash-based path always uses TargetName, so it
+// cannot work across a trust at all.
+//
+//   - Same domain (crossDomain=false): exactly the historical parsing, so
+//     existing single-domain behaviour is unchanged.
+//   - Cross domain with password: bind as UPN with an empty domain.
+//   - Cross domain with NT hash: errCrossDomainNTHash.
+func ntlmBindIdentity(ldapUser, targetDomain, credDomain string, crossDomain, hasHash bool) (string, string, error) {
+	if !crossDomain {
+		domain := targetDomain
+		username := ldapUser
+		if strings.Contains(username, "\\") {
+			parts := strings.SplitN(username, "\\", 2)
+			domain = parts[0]
+			username = parts[1]
+		} else if strings.Contains(username, "@") {
+			parts := strings.SplitN(username, "@", 2)
+			username = parts[0]
+			domain = parts[1]
+		}
+		return domain, username, nil
+	}
+
+	if hasHash {
+		return "", "", errCrossDomainNTHash
+	}
+
+	switch {
+	case strings.Contains(ldapUser, "@"):
+		// Already a UPN; pass it through untouched.
+		return "", ldapUser, nil
+	case strings.Contains(ldapUser, "\\"):
+		parts := strings.SplitN(ldapUser, "\\", 2)
+		// A DNS-style prefix (corp.local\user) is itself a usable UPN suffix;
+		// a NetBIOS prefix is not, so fall back to the credentials' DNS domain.
+		if strings.Contains(parts[0], ".") {
+			return "", parts[1] + "@" + parts[0], nil
+		}
+		return "", parts[1] + "@" + credDomain, nil
+	default:
+		return "", ldapUser + "@" + credDomain, nil
+	}
 }
 
 // simpleBind performs simple LDAP authentication (requires TLS for security)
@@ -418,12 +527,18 @@ func (c *Client) simpleBindNames() []string {
 		return names
 	}
 
+	// The first UPN guess uses the credentials' domain. For a normal
+	// single-domain client that is the target domain (historical behaviour);
+	// across a trust it is the home domain, because user@trusted.local would
+	// name an account that does not exist.
+	bindDomain := c.credentialDomain()
+
 	if strings.Contains(username, "\\") {
 		parts := strings.SplitN(username, "\\", 2)
 		domainPart := parts[0]
 		userPart := parts[1]
-		if c.domain != "" {
-			add(fmt.Sprintf("%s@%s", userPart, c.domain))
+		if bindDomain != "" {
+			add(fmt.Sprintf("%s@%s", userPart, bindDomain))
 		}
 		if strings.Contains(domainPart, ".") {
 			add(fmt.Sprintf("%s@%s", userPart, domainPart))
@@ -433,8 +548,8 @@ func (c *Client) simpleBindNames() []string {
 		return names
 	}
 
-	if c.domain != "" {
-		add(fmt.Sprintf("%s@%s", username, c.domain))
+	if bindDomain != "" {
+		add(fmt.Sprintf("%s@%s", username, bindDomain))
 	}
 	add(username)
 	return names
@@ -448,7 +563,9 @@ func (c *Client) gssapiBind(conn *ldap.Conn, dc string, overTLS bool) error {
 	if c.useKerberos {
 		gssClient, closeFn, err = newKerberosGSSAPIClient(c.krb5ConfigFile, c.krb5CCacheFile, c.krb5KeytabFile, c.krb5Realm, c.ldapUser, c.ldapPassword, overTLS, c.logger)
 	} else {
-		gssClient, closeFn, err = newGSSAPIClient(c.domain, c.ldapUser, c.ldapPassword)
+		// Windows SSPI qualifies a bare username with this domain, so it must be
+		// the credentials' domain rather than a trusted target domain.
+		gssClient, closeFn, err = newGSSAPIClient(c.credentialDomain(), c.ldapUser, c.ldapPassword)
 	}
 	if err != nil {
 		return err
@@ -1018,14 +1135,13 @@ func (c *Client) ResolveComputerSID(computerName string) (string, error) {
 		}
 	}
 
-	// Ensure computer name ends with $ for the sAMAccountName search
-	samName := computerName
-	if !strings.HasSuffix(samName, "$") {
-		samName = samName + "$"
-	}
+	samName := computerSAMAccountName(computerName)
 
 	// Check cache
 	if cached, ok := c.sidCache[samName]; ok {
+		if computerFQDNMismatch(computerName, cached.DNSHostName) {
+			return "", fmt.Errorf("computer not found: %s (%s belongs to %s)", computerName, samName, cached.DNSHostName)
+		}
 		return cached.SID, nil
 	}
 
@@ -1035,7 +1151,7 @@ func (c *Client) ResolveComputerSID(computerName string) (string, error) {
 		ldap.NeverDerefAliases,
 		1, 0, false,
 		fmt.Sprintf("(&(objectClass=computer)(sAMAccountName=%s))", ldap.EscapeFilter(samName)),
-		[]string{"sAMAccountName", "objectSid"},
+		[]string{"sAMAccountName", "objectSid", "dNSHostName"},
 		nil,
 	)
 
@@ -1057,16 +1173,54 @@ func (c *Client) ResolveComputerSID(computerName string) (string, error) {
 	}
 
 	// Cache the result
+	dnsHostName := entry.GetAttributeValue("dNSHostName")
 	c.sidCache[samName] = &types.DomainPrincipal{
 		SID:            sid,
 		SAMAccountName: entry.GetAttributeValue("sAMAccountName"),
 		ObjectClass:    "computer",
+		DNSHostName:    dnsHostName,
+	}
+
+	if computerFQDNMismatch(computerName, dnsHostName) {
+		return "", fmt.Errorf("computer not found: %s (%s belongs to %s)", computerName, samName, dnsHostName)
 	}
 
 	return sid, nil
 }
 
+// computerFQDNMismatch guards against a short-name collision across domains.
+// Because ResolveComputerSID searches by the short sAMAccountName, looking up
+// "sql01.trusted.local" in corp.local would otherwise return corp.local's own
+// SQL01$ - a different machine. When the caller supplied an FQDN and the
+// matched account advertises a different dNSHostName, the match is rejected.
+func computerFQDNMismatch(requested, dnsHostName string) bool {
+	requested = strings.TrimSuffix(strings.TrimSpace(requested), ".")
+	dnsHostName = strings.TrimSuffix(strings.TrimSpace(dnsHostName), ".")
+	if dnsHostName == "" || !strings.Contains(requested, ".") || net.ParseIP(requested) != nil {
+		return false
+	}
+	return !strings.EqualFold(requested, dnsHostName)
+}
+
 // Helper functions
+
+// computerSAMAccountName converts a host name into the sAMAccountName of its
+// computer account. AD stores computer accounts as "<NETBIOSNAME>$", so an
+// FQDN such as "sql01.corp.local" must be reduced to its first label before
+// the "$" is appended; searching for "sql01.corp.local$" never matches.
+// IP addresses are left intact (they cannot match either way).
+func computerSAMAccountName(computerName string) string {
+	name := strings.TrimSpace(computerName)
+	if net.ParseIP(strings.TrimSuffix(name, "$")) == nil {
+		if idx := strings.Index(name, "."); idx > 0 {
+			name = name[:idx]
+		}
+	}
+	if !strings.HasSuffix(name, "$") {
+		name += "$"
+	}
+	return name
+}
 
 // domainToDN converts a domain name to an LDAP distinguished name
 func domainToDN(domain string) string {

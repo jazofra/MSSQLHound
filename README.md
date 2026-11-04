@@ -60,6 +60,7 @@ Run MSSQLHound with a few common collection patterns:
     - [Multiple Servers](#multiple-servers)
     - [Full Domain Enumeration](#full-domain-enumeration)
     - [DNS and Domain Controller Configuration](#dns-and-domain-controller-configuration)
+    - [Cross-Domain Trusts](#cross-domain-trusts)
     - [SOCKS5 Proxy Support](#socks5-proxy-support)
     - [Credential Fallback](#credential-fallback)
     - [Kerberos Authentication](#kerberos-authentication)
@@ -460,6 +461,49 @@ When `--scan-all-computers` is set, SPN-discovered SQL Servers still honor their
 ./mssqlhound --scan-all-computers --dc 10.0.0.1 --dns-resolver 10.0.0.2
 ```
 
+### Cross-Domain Trusts
+
+SQL Servers often carry logins from other domains (for example `PARTNER\DBAs`), and linked servers often point at hosts in other domains. MSSQLHound handles this in two modes:
+
+- **Always on (passive).** When `--domain` is known, MSSQLHound reads the home domain's identity and its `trustedDomain` objects from the DC it already talks to. No new hosts are contacted. With that knowledge:
+  - logins from trusted domains get SID-keyed `User`/`Group`/`Computer` nodes named after their own domain (`DBAS@PARTNER.COM`);
+  - trusted-domain groups are no longer modelled as machine-local groups;
+  - SIDs and `DOMAIN\name` identities are never matched against a same-named account in the home domain.
+- **`--follow-trusts` (opt-in).** MSSQLHound also binds to the DCs of domains that trust the home domain (inbound or bidirectional trusts), using the home credentials. It then:
+  - resolves those domains' principals, service accounts, credentials and linked servers;
+  - when no `--targets` are given, enumerates their MSSQL SPNs (and all computers with `--scan-all-computers`) and collects their SQL Servers too.
+
+```bash
+# Collect the home domain and every domain that directly trusts it
+./mssqlhound -d corp.local --dc 10.0.0.1 --ldap-user 'CORP\svc' --ldap-password '...' --follow-trusts
+
+# Recon only: list the trust table and the SQL Servers found across trusts
+./mssqlhound -d corp.local --dc 10.0.0.1 --ldap-user 'CORP\svc' --ldap-password '...' --follow-trusts --domain-enum-only -v
+
+# Follow transitive trusts two hops out (e.g. sibling domains through the forest root)
+./mssqlhound -d emea.corp.local --ldap-user 'EMEA\svc' --ldap-password '...' --follow-trusts --trust-depth 2
+
+# Through a SOCKS proxy, where DNS SRV lookups for foreign DCs often fail
+./mssqlhound -d corp.local --dc 10.0.0.1 --proxy 127.0.0.1:1080 --ldap-user 'CORP\svc' --ldap-password '...' \
+  --follow-trusts --domain-dc partner.com=10.2.0.1,emea.corp.local=10.3.0.1
+```
+
+How it works and what to expect:
+
+- **Scope.** Only domains that trust ours are contacted. Each gets a single bind attempt. If it fails (unreachable DC, rejected credentials, selective authentication), that domain is disabled for the rest of the run and the home domain is unaffected. A home-domain rejection still stops every LDAP bind, to protect the account from lockout.
+- **Depth.** `--trust-depth 1` (the default) follows direct trusts only. Higher values follow further hops, but only through transitive trusts (within-forest or forest trusts), because authentication cannot chain through external trusts.
+- **DCs.** Trusted DCs are found through DNS SRV records via `--dns-resolver` (or `--dc`), unless overridden with `--domain-dc`. `--dc` always applies to the home domain only.
+- **Credentials.** The home credentials are reused:
+  - Password-based NTLM binds to trusted DCs are sent as `user@home.dns`.
+  - Kerberos relies on cross-realm referrals. When MSSQLHound auto-generates `krb5.conf`, `--follow-trusts` enables DNS KDC discovery and adds a realm for every `--domain-dc` entry.
+  - Windows SSPI with the current user works natively.
+
+Limitations:
+
+- NT hash (pass-the-hash) binds cannot cross a trust, because the NTLM library always uses the target DC's domain name. With `--nt-hash`, trusted domains are identified passively but not queried. Use a password or `-k` instead.
+- UPN-style NTLM authentication may be refused over external (non-forest) trusts, and selective authentication may block binds entirely.
+- Passive mode only knows the home domain's *direct* trusts. Principals from other domains in the forest (for example sibling domains) are only recognised with `--follow-trusts --trust-depth 2` or higher.
+
 ### SOCKS5 Proxy Support
 
 All network traffic (SQL connections, LDAP queries, EPA tests) can be tunneled through a SOCKS5 proxy:
@@ -668,6 +712,9 @@ mssqlhound completion powershell | Out-String | Invoke-Expression
 | `--dns-resolver` | DNS resolver IP address for domain lookups |
 | `--ldap-user` | Domain user (`DOMAIN\user` or `user@domain`) for LDAP queries and EPA testing; not used for SQL login |
 | `--ldap-password` | Password for `--ldap-user`; used for LDAP bind and EPA NTLM, not for SQL login |
+| `--follow-trusts` | Bind to DCs of domains that trust `--domain` (with the home credentials) to resolve their principals and linked servers; without `--targets`, also enumerate and collect their SQL Servers. See [Cross-Domain Trusts](#cross-domain-trusts) |
+| `--trust-depth` | Trust hops to follow with `--follow-trusts` (default `1` = direct trusts only; higher values follow transitive trusts) |
+| `--domain-dc` | DC overrides for trusted domains, e.g. `partner.com=10.2.0.1,emea.corp.local=dc01.emea.corp.local` (default: DNS SRV lookup) |
 
 ### Target Selection
 
@@ -848,7 +895,7 @@ There is no local PowerShell retry path for this condition. Check domain trust, 
 Use `--ldap-user` and `--ldap-password` when:
 
 1. **Full domain computer enumeration** (`--scan-all-computers`) - GSSAPI often fails with the Go library due to CBT issues
-2. **Cross-domain scenarios** - When enumerating from a machine in a different domain
+2. **Cross-domain scenarios** - When enumerating from a machine outside the target domain, or binding to trusted domains with `--follow-trusts` (see [Cross-Domain Trusts](#cross-domain-trusts))
 3. **Service account execution** - When running as a service account that may have Kerberos delegation issues
 4. **Troubleshooting GSSAPI failures** - As a workaround when implicit authentication fails
 

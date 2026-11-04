@@ -227,6 +227,14 @@ func runEdgeCreation(t *testing.T, serverInfo *types.ServerInfo, includeNontrave
 // overwritten with a fresh per-test temp directory.
 func runEdgeCreationWithConfig(t *testing.T, serverInfo *types.ServerInfo, config *Config) edgeTestResult {
 	t.Helper()
+	return runEdgeCreationWithSetup(t, serverInfo, config, nil)
+}
+
+// runEdgeCreationWithSetup is runEdgeCreationWithConfig with a hook that can
+// prepare the Collector before edges are generated (for example, seeding the
+// trust registry with trusted domains). setup may be nil.
+func runEdgeCreationWithSetup(t *testing.T, serverInfo *types.ServerInfo, config *Config, setup func(*Collector)) edgeTestResult {
+	t.Helper()
 
 	tmpDir, err := os.MkdirTemp("", "mssqlhound-edge-test")
 	if err != nil {
@@ -236,6 +244,9 @@ func runEdgeCreationWithConfig(t *testing.T, serverInfo *types.ServerInfo, confi
 
 	config.TempDir = tmpDir
 	c, _ := New(config)
+	if setup != nil {
+		setup(c)
+	}
 
 	outputPath := filepath.Join(tmpDir, "test-output.json")
 	writer, err := bloodhound.NewStreamingWriter(outputPath)

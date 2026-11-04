@@ -1459,6 +1459,8 @@ func TestADUserNodeNameStripsNETBIOSPrefix(t *testing.T) {
 		},
 	}
 	c, _ := New(&Config{TempDir: tmpDir, Domain: "CONTOSO.COM"})
+	// Block LDAP binds so the test never tries to reach a real DC.
+	c.setLDAPAuthFailed("")
 	if err := c.createADNodes(serverInfo); err != nil {
 		t.Fatalf("createADNodes: %v", err)
 	}
