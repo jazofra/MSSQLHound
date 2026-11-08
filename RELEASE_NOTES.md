@@ -1,4 +1,12 @@
 # MSSQLHound Release Notes
+## Unreleased
+- Cross-domain trust support:
+  - Passively read the home domain's trusts, so logins from trusted domains get correctly named, SID-keyed AD nodes and are no longer classified as machine-local groups.
+  - Add `--follow-trusts`, `--trust-depth` and `--domain-dc` to resolve principals and linked servers in trusting domains, and to enumerate and collect their SQL Servers.
+- Fix `DOMAIN\name` and foreign SID lookups matching same-named or ForeignSecurityPrincipal objects in the home domain.
+- Fix computer SID lookups by FQDN, which never matched in AD.
+- Avoid re-binding an LDAP client after a failed connection (lockout safety).
+
 ## Version 2.0.4 (June 29, 2026)
 - Move AD nodes/edges to separate file to prevent accidental deletion based on source_kind
 

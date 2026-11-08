@@ -30,6 +30,9 @@ var (
 	dnsResolver    string
 	ldapUser       string
 	ldapPassword   string
+	followTrusts   bool   // Resolve principals and collect SQL Servers across domain trusts
+	trustDepth     int    // Trust hops to follow with --follow-trusts
+	domainDCMap    string // trusted.dns=dc[,...] DC overrides for trusted domains
 	useKerberos    bool   // Use Kerberos authentication
 	krb5ConfigFile string // Path to krb5.conf
 	krb5CCacheFile string // Path to ccache file
@@ -142,6 +145,9 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	rootCmd.Flags().BoolVar(&enableDataAccessEdges, "enable-data-access-edges", false, "Create non-traversable ReadDB/WriteDB/DeleteDB edges for principals that can read, write, or delete data in a database")
 	rootCmd.Flags().BoolVar(&skipIPDedupe, "skip-ip-dedupe", false, "Skip DNS-based target deduplication (keeps all targets even if they resolve to the same IP)")
 	rootCmd.Flags().StringVar(&scanAllComputerPorts, "scan-all-computer-ports", "1433", "Comma-separated TCP ports to scan for --scan-all-computers targets")
+	rootCmd.Flags().BoolVar(&followTrusts, "follow-trusts", false, "Bind to DCs of domains that trust --domain to resolve their principals and linked servers, and (without --targets) enumerate and collect their SQL Servers")
+	rootCmd.Flags().IntVar(&trustDepth, "trust-depth", 1, "Trust hops to follow with --follow-trusts (1 = direct trusts only; higher values follow transitive trusts)")
+	rootCmd.Flags().StringVar(&domainDCMap, "domain-dc", "", "DC overrides for trusted domains: trusted.local=10.1.0.1[,other.local=dc.other.local] (default: DNS SRV lookup)")
 	rootCmd.Flags().IntVar(&linkedServerTimeout, "linked-timeout", 300, "Linked server enumeration timeout (seconds)")
 	rootCmd.Flags().IntVar(&portCheckTimeout, "port-check-timeout", 2, "TCP port reachability timeout before skipping a target (seconds)")
 	rootCmd.Flags().IntVar(&memoryThresholdPercent, "memory-threshold", 90, "Stop when memory exceeds this percentage")
@@ -166,7 +172,8 @@ Collects BloodHound OpenGraph compatible data from one or more MSSQL servers int
 	}
 	for _, name := range []string{"scan-all-computers", "skip-private-address",
 		"domain-enum-only", "skip-linked-servers", "collect-from-linked",
-		"skip-ad-nodes", "disable-nontraversable-edges", "disable-possible-edges", "enable-data-access-edges", "skip-ip-dedupe", "scan-all-computer-ports"} {
+		"skip-ad-nodes", "disable-nontraversable-edges", "disable-possible-edges", "enable-data-access-edges", "skip-ip-dedupe", "scan-all-computer-ports",
+		"follow-trusts", "trust-depth", "domain-dc"} {
 		rootCmd.Flags().SetAnnotation(name, "group", []string{"Collection"}) //nolint:errcheck
 	}
 	for _, name := range []string{"linked-timeout", "workers", "file-size-limit",
@@ -399,6 +406,13 @@ func run(cmd *cobra.Command, args []string) error {
 	if portCheckTimeout <= 0 {
 		return fmt.Errorf("--port-check-timeout must be greater than 0 seconds")
 	}
+	if trustDepth < 1 {
+		return fmt.Errorf("--trust-depth must be at least 1")
+	}
+	parsedDomainDCs, err := parseDomainDCMap(domainDCMap)
+	if err != nil {
+		return fmt.Errorf("invalid --domain-dc: %w", err)
+	}
 
 	// Determine what to upload: default is both schema and results
 	uploadSchema := true
@@ -427,6 +441,9 @@ func run(cmd *cobra.Command, args []string) error {
 		DNSResolver:                dnsResolver,
 		LDAPUser:                   effectiveLDAPUser,
 		LDAPPassword:               effectiveLDAPPassword,
+		FollowTrusts:               followTrusts,
+		TrustDepth:                 trustDepth,
+		DomainDCs:                  parsedDomainDCs,
 		TempDir:                    tempDir,
 		ZipDir:                     zipDir,
 		FileSizeLimit:              fileSizeLimit,
@@ -519,6 +536,40 @@ func parsePortList(value string) ([]int, error) {
 		return nil, fmt.Errorf("at least one port is required")
 	}
 	return ports, nil
+}
+
+// parseDomainDCMap parses --domain-dc: comma-separated "dns.domain=dc" pairs
+// mapping a trusted domain to the domain controller to bind to (useful through
+// SOCKS proxies, where DNS SRV discovery of foreign DCs often fails). Keys are
+// normalised to lower case without a trailing dot. An empty value yields nil.
+func parseDomainDCMap(value string) (map[string]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+	result := make(map[string]string)
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("empty entry")
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("%q is not in domain=dc form", part)
+		}
+		domainName := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(kv[0]), "."))
+		dcHost := strings.TrimSpace(kv[1])
+		if domainName == "" || dcHost == "" {
+			return nil, fmt.Errorf("%q is not in domain=dc form", part)
+		}
+		if !strings.Contains(domainName, ".") {
+			return nil, fmt.Errorf("%q must be a DNS domain name (e.g. trusted.local)", kv[0])
+		}
+		if _, exists := result[domainName]; exists {
+			return nil, fmt.Errorf("duplicate domain %q", domainName)
+		}
+		result[domainName] = dcHost
+	}
+	return result, nil
 }
 
 // extractTargetCredentials parses user:password@target from a target string.

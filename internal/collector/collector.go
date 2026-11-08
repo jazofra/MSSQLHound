@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SpecterOps/MSSQLHound/internal/ad"
@@ -47,6 +48,11 @@ type Config struct {
 	DNSResolver    string // DNS resolver to use for lookups
 	LDAPUser       string
 	LDAPPassword   string
+
+	// Cross-domain trust options
+	FollowTrusts bool              // Bind to DCs of trusting domains to resolve principals and collect their SQL Servers
+	TrustDepth   int               // Trust hops to follow with FollowTrusts (1 = direct trusts only)
+	DomainDCs    map[string]string // Lower-case DNS domain -> DC host override for trusted domains
 
 	// Output options
 	TempDir       string
@@ -113,6 +119,11 @@ type Collector struct {
 	ldapAuthFailed             bool                      // Set when LDAP auth fails with invalid credentials to prevent lockout
 	ldapAuthFailedMu           sync.RWMutex              // Protects ldapAuthFailed
 	spnEnumerationDone         bool                      // true after initial broad SPN sweep completed
+
+	// Cross-domain trust state (see domains.go)
+	domains           *domainRegistry // Known domains: home plus trusts
+	domainsDiscovered bool            // discoverDomains already ran (single-threaded phase)
+	homeLDAPBindOK    atomic.Bool     // A home-domain LDAP bind succeeded, proving the credentials
 
 	// Accumulated AD nodes across all servers for separate file output
 	adComputers []*bloodhound.Node
@@ -191,6 +202,7 @@ func New(config *Config) (*Collector, error) {
 	c := &Collector{
 		config:           config,
 		serverSPNData:    make(map[string]*ServerSPNInfo),
+		domains:          newDomainRegistry(),
 		adSeenNodes:      make(map[string]bool),
 		totalNodesByKind: make(map[string]int),
 		totalEdgesByKind: make(map[string]int),
@@ -211,7 +223,9 @@ func New(config *Config) (*Collector, error) {
 		}
 		if _, err := os.Stat(configPath); os.IsNotExist(err) {
 			if config.Domain != "" && config.DC != "" {
-				generated, genErr := mssql.GenerateKrb5Config(config.Domain, config.DC)
+				// With --follow-trusts the file also lists the --domain-dc KDCs and
+				// enables DNS KDC discovery so cross-realm referrals can complete.
+				generated, genErr := mssql.GenerateKrb5ConfigWithTrusts(config.Domain, config.DC, config.DomainDCs, config.FollowTrusts)
 				if genErr != nil {
 					config.Logger.Warn("Failed to auto-generate krb5.conf", "error", genErr)
 				} else {
@@ -259,6 +273,14 @@ func (c *Collector) targetDNSResolver() *net.Resolver {
 // newADClient creates a new AD client with proxy settings if configured.
 // Returns nil if a previous LDAP attempt already failed with invalid credentials
 // to prevent further authentication attempts that could lock out the AD account.
+//
+// DC selection is domain-aware:
+//   - the home domain and any domain not in the trust registry use --dc
+//     (the historical behaviour, so single-domain runs are unchanged);
+//   - a registered trusted domain uses its --domain-dc override or DNS SRV,
+//     binds with the home credentials (see ad.Client.SetCredentialDomain),
+//     and is only contacted once discovery confirmed it is queryable. This
+//     keeps passive mode (no --follow-trusts) from ever reaching new hosts.
 func (c *Collector) newADClient(domain string) *ad.Client {
 	c.ldapAuthFailedMu.RLock()
 	failed := c.ldapAuthFailed
@@ -266,24 +288,30 @@ func (c *Collector) newADClient(domain string) *ad.Client {
 	if failed {
 		return nil
 	}
-	adClient := ad.NewClient(domain, c.config.DC, c.config.SkipPrivateAddress, c.config.LDAPUser, c.config.LDAPPassword, c.getDNSResolver())
-	if c.config.NTHash != "" {
-		adClient.SetNTHash(c.config.NTHash)
+	if e := c.domains.forDomain(domain); e != nil && !e.isHome {
+		if !c.domains.usable(e) || e.DNSName == "" {
+			return nil
+		}
+		return c.buildADClient(c.trustedClientTarget(e))
 	}
-	if c.config.UseKerberos {
-		adClient.SetKerberosConfig(c.config.Krb5ConfigFile, c.config.Krb5CCacheFile, c.config.Krb5KeytabFile, c.config.Krb5Realm)
-	}
-	if c.config.Verbose {
-		adClient.SetLogger(c.config.Logger)
-	}
-	if c.proxyDialer != nil {
-		adClient.SetProxyDialer(c.proxyDialer)
-	}
-	return adClient
+	return c.buildADClient(domain, c.config.DC, "")
 }
 
-// setLDAPAuthFailed marks LDAP authentication as failed to prevent further attempts.
-func (c *Collector) setLDAPAuthFailed() {
+// setLDAPAuthFailed records rejected LDAP credentials for domain.
+//
+// For the home domain (or "" / any unregistered domain, which binds to the
+// same --dc with the same credentials) this sets the collector-wide flag
+// that stops every further LDAP bind, protecting the account from lockout.
+// For a registered trusted domain only that domain is disabled: a rejection
+// there usually reflects trust direction or selective authentication rather
+// than a wrong password, and each trusted domain only ever gets one attempt.
+func (c *Collector) setLDAPAuthFailed(domain string) {
+	if e := c.domains.forDomain(domain); e != nil && !e.isHome {
+		if c.domains.disable(e, "authentication rejected") {
+			c.config.Logger.Warn("LDAP authentication rejected by trusted domain; disabling lookups there", "domain", e.DNSName)
+		}
+		return
+	}
 	c.ldapAuthFailedMu.Lock()
 	c.ldapAuthFailed = true
 	c.ldapAuthFailedMu.Unlock()
@@ -953,24 +981,48 @@ func (c *Collector) buildServerList() error {
 		}
 	}
 
+	// No explicit targets: auto-detect the domain to enumerate SPNs from.
+	if len(c.serversToProcess) == 0 && c.config.Domain == "" {
+		c.config.Domain = c.detectDomain()
+	}
+
+	// Learn the home domain's identity and trusts (and, with --follow-trusts,
+	// bind to the domains that trust ours) now that the home domain is final
+	// and before SPN enumeration, so enumeration can span trusts and every
+	// later lookup can be routed to the domain that owns the principal. The
+	// shared client is reused so this adds queries, not an extra bind.
+	if c.config.Domain != "" && sharedADClient == nil && c.shouldDiscoverDomains() {
+		sharedADClient = c.newADClient(c.config.Domain)
+		if sharedADClient != nil {
+			defer sharedADClient.Close()
+		}
+	}
+	c.discoverDomains(sharedADClient)
+
 	// If no servers specified, enumerate SPNs from Active Directory
 	if len(c.serversToProcess) == 0 {
-		// Auto-detect domain if not provided
 		domain := c.config.Domain
-		if domain == "" {
-			domain = c.detectDomain()
-		}
-
 		if domain != "" {
-			// Update config.Domain so it's available for later resolution
-			c.config.Domain = domain
 			c.config.Logger.With("target", domain).Info("No servers specified, enumerating MSSQL SPNs from Active Directory")
-			if err := c.enumerateServersFromAD(); err != nil {
+			if err := c.enumerateServersFromDomain(domain, sharedADClient); err != nil {
 				hint := "Hint: use --server/--server-list/--server-list-file to specify servers manually, or --ldap-user/--ldap-password for LDAP credentials"
 				if runtime.GOOS != "windows" && c.config.LDAPUser == "" {
 					hint = "On Linux/macOS, explicit LDAP credentials are required for SPN enumeration. Use --ldap-user and --ldap-password, or specify servers manually with --server/--server-list/--server-list-file"
 				}
 				c.config.Logger.Error(hint, "error", err)
+			}
+
+			// --follow-trusts: also discover SQL Servers in every trusted
+			// domain that accepted our bind during discovery. Explicit
+			// targets never widen the scope this way.
+			if c.config.FollowTrusts {
+				for _, e := range c.domains.usableTrusted() {
+					trusted := strings.ToUpper(e.DNSName)
+					c.config.Logger.With("target", trusted).Info("Enumerating MSSQL SPNs in trusted domain")
+					if err := c.enumerateServersFromDomain(trusted, nil); err != nil {
+						c.config.Logger.Warn("SPN enumeration in trusted domain failed", "domain", trusted, "error", err)
+					}
+				}
 			}
 		} else {
 			c.config.Logger.Error("No servers specified and could not detect domain. Use --domain to specify a domain or --server to specify a server.")
@@ -1242,23 +1294,27 @@ func (c *Collector) ipDedupeWorkerCount(uniqueHostnames int) int {
 // tryResolveSID attempts to resolve the computer SID for a server.
 // If sharedClient is non-nil, it is used for LDAP lookups instead of creating a new connection.
 func (c *Collector) tryResolveSID(server *ServerToProcess, sharedClient *ad.Client) {
-	if c.config.Domain == "" {
+	// Resolve in the domain the server belongs to (its FQDN's registered
+	// domain, the domain it was discovered in, else --domain).
+	domain := c.serverDomain(server)
+	if domain == "" {
 		return
 	}
 
 	// Try Windows API first
 	if runtime.GOOS == "windows" {
-		sid, err := c.resolveComputerSIDWindows(server.Hostname, c.config.Domain)
+		sid, err := c.resolveComputerSIDWindows(server.Hostname, domain)
 		if err == nil && sid != "" {
 			server.ComputerSID = sid
 			return
 		}
 	}
 
-	// Use shared client if available, otherwise create a one-off client
+	// Use the shared client only when it queries the same domain; otherwise
+	// create a one-off client for the server's own domain.
 	adClient := sharedClient
-	if adClient == nil {
-		adClient = c.newADClient(c.config.Domain)
+	if adClient == nil || !strings.EqualFold(adClient.Domain(), domain) {
+		adClient = c.newADClient(domain)
 		if adClient == nil {
 			return
 		}
@@ -1267,7 +1323,7 @@ func (c *Collector) tryResolveSID(server *ServerToProcess, sharedClient *ad.Clie
 
 	sid, err := adClient.ResolveComputerSID(server.Hostname)
 	if err != nil && isLDAPAuthError(err) {
-		c.setLDAPAuthFailed()
+		c.setLDAPAuthFailed(domain)
 		return
 	}
 	if err == nil && sid != "" {
@@ -1344,31 +1400,38 @@ func (c *Collector) detectDomain() string {
 	return ""
 }
 
-// enumerateServersFromAD discovers MSSQL servers from Active Directory SPNs.
-// Uses a single shared LDAP connection for all SPN enumeration and SID resolution.
-func (c *Collector) enumerateServersFromAD() error {
-	// Create a single AD client for the entire enumeration phase.
-	// This client is reused for SPN enumeration, ScanAllComputers, and per-server SID resolution.
-	adClient := c.newADClient(c.config.Domain)
+// enumerateServersFromDomain discovers MSSQL servers from the Active Directory
+// SPNs of one domain (the home domain, or a trusted domain with
+// --follow-trusts). adClient may be a shared client already bound to that
+// domain; when nil a client is created (and closed) here. A single LDAP
+// connection serves SPN enumeration, ScanAllComputers, and per-server SID
+// resolution.
+func (c *Collector) enumerateServersFromDomain(domain string, adClient *ad.Client) error {
+	isHome := c.isHomeDomain(domain)
 	if adClient == nil {
-		return fmt.Errorf("LDAP authentication previously failed, skipping AD enumeration")
+		adClient = c.newADClient(domain)
+		if adClient == nil {
+			return fmt.Errorf("LDAP authentication previously failed or domain %s is not queryable, skipping AD enumeration", domain)
+		}
+		defer adClient.Close()
 	}
-	defer adClient.Close()
 
 	spns, err := adClient.EnumerateMSSQLSPNs()
 	sharedADClient := adClient
 	usingADSIComputerFallback := false
 
-	if c.shouldUseScanAllWindowsADSIFallback(err) {
+	// The Windows ADSI fallback always queries the configured --domain, so it
+	// is only meaningful for the home domain.
+	if isHome && c.shouldUseScanAllWindowsADSIFallback(err) {
 		c.config.Logger.Log(context.Background(), logging.LevelVerbose, "LDAP SPN enumeration failed before Windows ADSI fallback", "error", ldapErrorSummary(err))
 		c.config.Logger.Info("LDAP SPN enumeration failed, continuing ScanAllComputers with Windows ADSI fallback")
-		c.setLDAPAuthFailed()
+		c.setLDAPAuthFailed(domain)
 		sharedADClient = nil
 		spns = nil
 		err = nil
 		usingADSIComputerFallback = true
 	} else if err != nil && isLDAPAuthError(err) {
-		c.setLDAPAuthFailed()
+		c.setLDAPAuthFailed(domain)
 		return fmt.Errorf("LDAP authentication failed: %w", err)
 	}
 
@@ -1377,15 +1440,26 @@ func (c *Collector) enumerateServersFromAD() error {
 	}
 
 	if !usingADSIComputerFallback {
-		c.config.Logger.Info("LDAP bind successful", "auth", adClient.AuthMethod())
+		c.config.Logger.Info("LDAP bind successful", "domain", domain, "auth", adClient.AuthMethod())
+		if isHome {
+			c.homeLDAPBindOK.Store(true)
+		}
 	}
-	c.config.Logger.Info("Found MSSQL SPNs", "count", len(spns))
+	c.config.Logger.Info("Found MSSQL SPNs", "domain", domain, "count", len(spns))
+
+	// Servers found in a trusted domain remember it, so later lookups for
+	// them (computer SID, per-host SPNs, FQDN retry) target that domain.
+	discoveredDomain := ""
+	if !isHome {
+		discoveredDomain = domain
+	}
 
 	for _, spn := range spns {
 		// Create ServerToProcess from SPN
 		server := &ServerToProcess{
 			Hostname: spn.Hostname,
 			Port:     1433, // Default
+			Domain:   discoveredDomain,
 		}
 
 		// Parse port or instance from SPN
@@ -1447,16 +1521,16 @@ func (c *Collector) enumerateServersFromAD() error {
 			computers = domainComputersFromNames(computerNames)
 			err = enumErr
 		}
-		if !usingADSIComputerFallback && c.shouldUseWindowsADSIFallback(err) {
+		if !usingADSIComputerFallback && isHome && c.shouldUseWindowsADSIFallback(err) {
 			// Try in-process ADSI fallback on Windows.
 			computerLDAPFallbackErr = err
 			c.config.Logger.Log(context.Background(), logging.LevelVerbose, "LDAP computer enumeration failed before Windows ADSI fallback", "error", ldapErrorSummary(err))
 			c.config.Logger.Info("LDAP computer enumeration failed, trying Windows ADSI fallback")
-			c.setLDAPAuthFailed()
+			c.setLDAPAuthFailed(domain)
 			sharedADClient = nil
 			computers, err = c.enumerateComputersViaWindowsADSI()
 		} else if err != nil && isLDAPAuthError(err) {
-			c.setLDAPAuthFailed()
+			c.setLDAPAuthFailed(domain)
 			c.config.Logger.Warn("LDAP authentication failed", "error", err)
 			return nil
 		}
@@ -1471,6 +1545,7 @@ func (c *Collector) enumerateServersFromAD() error {
 			lastProgress := time.Now()
 			for i, computer := range computers {
 				for _, server := range c.scanAllComputerServers(computer) {
+					server.Domain = discoveredDomain
 					if server.ComputerSID == "" {
 						c.tryResolveSID(server, sharedADClient)
 					}
@@ -1491,7 +1566,10 @@ func (c *Collector) enumerateServersFromAD() error {
 	}
 
 	c.config.Logger.Info("Unique servers to process", "count", len(c.serversToProcess))
-	c.spnEnumerationDone = true
+	if isHome {
+		c.spnEnumerationDone = true
+	}
+	c.domains.markSPNSwept(domain)
 	return nil
 }
 
@@ -1644,8 +1722,11 @@ func (c *Collector) processServer(server *ServerToProcess) error {
 	if err := client.Connect(ctx); err != nil {
 		// If SQL auth failed and the same credentials are used for LDAP, mark LDAP
 		// as failed too to prevent redundant auth attempts that could lock out the account.
-		if mssql.IsAuthError(err) && c.config.UserID == c.config.LDAPUser {
-			c.setLDAPAuthFailed()
+		// Skip this once a home LDAP bind has succeeded: that proves the password is
+		// valid, so the SQL failure means "no login on this server" (common when
+		// scanning trusted domains), not bad credentials.
+		if mssql.IsAuthError(err) && c.config.UserID == c.config.LDAPUser && !c.homeLDAPBindOK.Load() {
+			c.setLDAPAuthFailed("")
 		}
 
 		// If hostname doesn't have a domain but we have one from linked server discovery, try FQDN
@@ -1802,21 +1883,18 @@ connected:
 		log.Warn("Could not determine service account (sys.dm_server_services, registry, and SPN lookup all failed)")
 	}
 
-	// Create a shared AD client for all LDAP resolution calls within this server.
-	// This avoids the N+1 connection problem where each resolution call would
-	// create its own LDAP connection (TCP + TLS + bind) per identity.
-	var sharedADClient *ad.Client
-	if c.config.Domain != "" {
-		sharedADClient = c.newADClient(c.config.Domain)
-		if sharedADClient != nil {
-			defer sharedADClient.Close()
-		}
-	}
+	// One lazily-populated set of LDAP clients (one per domain) serves every
+	// resolution call for this server. This avoids the N+1 connection problem
+	// where each call would create its own LDAP connection (TCP + TLS + bind),
+	// and routes each identity to the domain that owns it. The set is local to
+	// this goroutine because ad.Client is not thread-safe.
+	adClients := c.newDomainClientSet()
+	defer adClients.Close()
 
 	// If we couldn't get the computer SID from SQL Server, try other methods
 	// The resolution function will extract domain from FQDN if not provided
 	if serverInfo.ComputerSID == "" {
-		c.resolveComputerSIDViaLDAP(serverInfo, log, sharedADClient)
+		c.resolveComputerSIDViaLDAP(serverInfo, log, adClients)
 	}
 
 	// Convert built-in service accounts (LocalSystem, Local Service, Network Service)
@@ -1824,13 +1902,13 @@ connected:
 	c.preprocessServiceAccounts(serverInfo, log)
 
 	// Resolve service account SIDs via LDAP if they don't have SIDs
-	c.resolveServiceAccountSIDsViaLDAP(serverInfo, log, sharedADClient)
+	c.resolveServiceAccountSIDsViaLDAP(serverInfo, log, adClients)
 
 	// Resolve credential identity SIDs via LDAP for credential edges
-	c.resolveCredentialSIDsViaLDAP(serverInfo, log, sharedADClient)
+	c.resolveCredentialSIDsViaLDAP(serverInfo, log, adClients)
 
 	// Enumerate local Windows groups that have SQL logins and their domain members
-	c.enumerateLocalGroupMembers(serverInfo, log)
+	c.enumerateLocalGroupMembers(serverInfo, log, adClients)
 
 	// Check CVE-2025-49758 patch status
 	c.logCVE202549758Status(serverInfo, log)
@@ -1856,17 +1934,20 @@ connected:
 // spnInfo may be nil if only EPA data is available; epaResult may be nil if only SPN data is available.
 func (c *Collector) processServerFromSPNData(server *ServerToProcess, spnInfo *ServerSPNInfo, epaResult *mssql.EPATestResult, connErr error, log *slog.Logger) error {
 
+	// The server's own domain (a trusted domain it was discovered in, else --domain)
+	serverDomain := c.serverDomain(server)
+
 	// Try to resolve the FQDN
 	fqdn := server.Hostname
-	if !strings.Contains(server.Hostname, ".") && c.config.Domain != "" {
-		fqdn = fmt.Sprintf("%s.%s", server.Hostname, strings.ToLower(c.config.Domain))
+	if !strings.Contains(server.Hostname, ".") && serverDomain != "" {
+		fqdn = fmt.Sprintf("%s.%s", server.Hostname, strings.ToLower(serverDomain))
 	}
 
 	// Try to resolve computer SID if not already resolved
 	computerSID := server.ComputerSID
-	if computerSID == "" && c.config.Domain != "" {
+	if computerSID == "" && serverDomain != "" {
 		if runtime.GOOS == "windows" {
-			sid, err := c.resolveComputerSIDWindows(server.Hostname, c.config.Domain)
+			sid, err := c.resolveComputerSIDWindows(server.Hostname, serverDomain)
 			if err == nil && sid != "" {
 				computerSID = sid
 				server.ComputerSID = sid
@@ -1964,6 +2045,13 @@ func (c *Collector) lookupSPNsForServer(server *ServerToProcess) *ServerSPNInfo 
 		domain = server.Domain
 		c.config.Logger.Log(context.Background(), logging.LevelVerbose, "Using domain from linked server discovery", "domain", domain)
 	}
+	// A server in a registered trusted domain (by FQDN, or discovered there)
+	// has its SPNs in that domain, not in --domain.
+	if e := c.domains.forHost(server.Hostname); e != nil && e.DNSName != "" {
+		domain = e.DNSName
+	} else if e := c.domains.forDomain(server.Domain); e != nil && !e.isHome && e.DNSName != "" {
+		domain = e.DNSName
+	}
 
 	if domain == "" {
 		c.config.Logger.Warn("Cannot lookup SPN - no domain available")
@@ -1971,7 +2059,7 @@ func (c *Collector) lookupSPNsForServer(server *ServerToProcess) *ServerSPNInfo 
 	}
 
 	// If we already did a full SPN sweep for the same domain, a per-host lookup won't find anything new
-	if c.spnEnumerationDone && strings.EqualFold(domain, c.config.Domain) {
+	if (c.spnEnumerationDone && strings.EqualFold(domain, c.config.Domain)) || c.domains.spnSwept(domain) {
 		return nil
 	}
 
@@ -1988,7 +2076,7 @@ func (c *Collector) lookupSPNsForServer(server *ServerToProcess) *ServerSPNInfo 
 	}
 
 	if err != nil && isLDAPAuthError(err) {
-		c.setLDAPAuthFailed()
+		c.setLDAPAuthFailed(domain)
 		c.config.Logger.Warn("AD SPN lookup failed (invalid credentials)", "error", err)
 		return nil
 	}
@@ -2077,10 +2165,17 @@ func (c *Collector) parseServerInstance(serverInstance string) (hostname, port, 
 }
 
 // resolveComputerSIDViaLDAP attempts to resolve the computer SID via multiple methods.
-// If sharedClient is non-nil, it is used for LDAP lookups instead of creating a new connection.
-func (c *Collector) resolveComputerSIDViaLDAP(serverInfo *types.ServerInfo, log *slog.Logger, sharedClient *ad.Client) {
-	// Try to determine the domain from the FQDN if not provided
+// LDAP lookups go through adClients, in the domain the server belongs to.
+func (c *Collector) resolveComputerSIDViaLDAP(serverInfo *types.ServerInfo, log *slog.Logger, adClients *domainClientSet) {
+	// A registered domain matching the server's FQDN wins (e.g. a server in a
+	// trusted domain); otherwise use --domain, or the FQDN suffix if unset.
 	domain := c.config.Domain
+	for _, host := range []string{serverInfo.FQDN, serverInfo.Hostname} {
+		if e := c.domains.forHost(host); e != nil && e.DNSName != "" {
+			domain = strings.ToUpper(e.DNSName)
+			break
+		}
+	}
 	if domain == "" && strings.Contains(serverInfo.FQDN, ".") {
 		// Extract domain from FQDN (e.g., server.domain.com -> domain.com)
 		parts := strings.SplitN(serverInfo.FQDN, ".", 2)
@@ -2123,21 +2218,8 @@ func (c *Collector) resolveComputerSIDViaLDAP(serverInfo *types.ServerInfo, log 
 
 	log.Log(context.Background(), logging.LevelVerbose, "Attempting to resolve computer SID", "machine", machineName, "domain", domain, "method", "LDAP")
 
-	// Use shared client if available, otherwise create a one-off client
-	adClient := sharedClient
-	if adClient == nil {
-		adClient = c.newADClient(domain)
-		if adClient == nil {
-			return
-		}
-		defer adClient.Close()
-	}
-
-	sid, err := adClient.ResolveComputerSID(machineName)
+	sid, err := adClients.resolveComputerSID(domain, machineName)
 	if err != nil {
-		if isLDAPAuthError(err) {
-			c.setLDAPAuthFailed()
-		}
 		log.Info("Could not resolve computer SID via LDAP", "error", err)
 		return
 	}
@@ -2287,8 +2369,8 @@ func (c *Collector) preprocessServiceAccounts(serverInfo *types.ServerInfo, log 
 }
 
 // resolveServiceAccountSIDsViaLDAP resolves service account SIDs via multiple methods.
-// If sharedClient is non-nil, it is used for LDAP lookups instead of creating a new connection per account.
-func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInfo, log *slog.Logger, sharedClient *ad.Client) {
+// LDAP lookups go through adClients, routed to the domain that owns each account.
+func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInfo, log *slog.Logger, adClients *domainClientSet) {
 	for i := range serverInfo.ServiceAccounts {
 		sa := &serverInfo.ServiceAccounts[i]
 
@@ -2333,22 +2415,9 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 				continue
 			}
 
-			// For other computer accounts, try LDAP
+			// For other computer accounts, try LDAP in the domain that owns the SID
 			if c.config.Domain != "" {
-				// Use shared client if available, otherwise create a one-off client
-				adClient := sharedClient
-				if adClient == nil {
-					adClient = c.newADClient(c.config.Domain)
-					if adClient == nil {
-						continue
-					}
-					defer adClient.Close()
-				}
-				principal, err := adClient.ResolveSID(sa.SID)
-				if err != nil && isLDAPAuthError(err) {
-					c.setLDAPAuthFailed()
-					continue
-				}
+				principal, err := adClients.resolveSID(sa.SID)
 				if err == nil && principal != nil && principal.ObjectClass == "computer" {
 					// Use the resolved name (which is DNSHostName for computers in our updated AD client)
 					oldName := sa.Name
@@ -2368,20 +2437,8 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 				continue
 			}
 
-			// Use shared client if available, otherwise create a one-off client
-			adClient := sharedClient
-			if adClient == nil {
-				adClient = c.newADClient(c.config.Domain)
-				if adClient == nil {
-					continue
-				}
-				defer adClient.Close()
-			}
-			principal, err := adClient.ResolveName(sa.Name)
-			if err != nil && isLDAPAuthError(err) {
-				c.setLDAPAuthFailed()
-				continue
-			}
+			// Resolve in the domain named by the account's qualifier
+			principal, err := adClients.resolveName(sa.Name)
 			if err != nil {
 				log.Info("Could not resolve service account via LDAP", "account", sa.Name, "error", err)
 				continue
@@ -2401,8 +2458,8 @@ func (c *Collector) resolveServiceAccountSIDsViaLDAP(serverInfo *types.ServerInf
 
 // resolveCredentialSIDsViaLDAP resolves credential identities to AD SIDs.
 // This matches PowerShell's Resolve-DomainPrincipal behavior for credential edges.
-// If sharedClient is non-nil, it is used for LDAP lookups instead of creating a new connection per credential.
-func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo, log *slog.Logger, sharedClient *ad.Client) {
+// Lookups go through adClients, routed to the domain named by each identity.
+func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo, log *slog.Logger, adClients *domainClientSet) {
 	if c.config.Domain == "" {
 		return
 	}
@@ -2414,20 +2471,7 @@ func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo, l
 		if identity == "" {
 			return nil
 		}
-		// Use shared client if available, otherwise create a one-off client
-		adClient := sharedClient
-		if adClient == nil {
-			adClient = c.newADClient(c.config.Domain)
-			if adClient == nil {
-				return nil
-			}
-			defer adClient.Close()
-		}
-		principal, err := adClient.ResolveName(identity)
-		if err != nil && isLDAPAuthError(err) {
-			c.setLDAPAuthFailed()
-			return nil
-		}
+		principal, err := adClients.resolveName(identity)
 		if err != nil || principal == nil || principal.SID == "" {
 			return nil
 		}
@@ -2478,7 +2522,7 @@ func (c *Collector) resolveCredentialSIDsViaLDAP(serverInfo *types.ServerInfo, l
 }
 
 // enumerateLocalGroupMembers finds local Windows groups that have SQL logins and enumerates their domain members via WMI
-func (c *Collector) enumerateLocalGroupMembers(serverInfo *types.ServerInfo, log *slog.Logger) {
+func (c *Collector) enumerateLocalGroupMembers(serverInfo *types.ServerInfo, log *slog.Logger, adClients *domainClientSet) {
 	if runtime.GOOS != "windows" {
 		log.Log(context.Background(), logging.LevelVerbose, "Skipping local group enumeration (not on Windows)")
 		return
@@ -2544,17 +2588,11 @@ func (c *Collector) enumerateLocalGroupMembers(serverInfo *types.ServerInfo, log
 				}
 			}
 
-			// Fall back to LDAP if Windows API didn't work and we have a domain
+			// Fall back to LDAP if Windows API didn't work and we have a domain;
+			// the member's NetBIOS domain routes the lookup to its own domain.
 			if lm.SID == "" && c.config.Domain != "" {
-				adClient := c.newADClient(c.config.Domain)
-				if adClient != nil {
-					resolved, err := adClient.ResolveName(fullName)
-					adClient.Close()
-					if err != nil && isLDAPAuthError(err) {
-						c.setLDAPAuthFailed()
-					} else if err == nil && resolved.SID != "" {
-						lm.SID = resolved.SID
-					}
+				if resolved, err := adClients.resolveName(fullName); err == nil && resolved.SID != "" {
+					lm.SID = resolved.SID
 				}
 			}
 
@@ -2838,9 +2876,9 @@ func (c *Collector) createServerNode(info *types.ServerInfo) *bloodhound.Node {
 			continue
 		}
 
-		// Only include principals with domain SIDs (S-1-5-21-<domainSID>-...)
-		// This filters out BUILTIN, NT AUTHORITY, NT SERVICE accounts
-		if info.DomainSID == "" || !strings.HasPrefix(principal.SecurityIdentifier, info.DomainSID+"-") {
+		// Only include principals with domain SIDs (the server's domain or a known
+		// trusted domain). This filters out BUILTIN, NT AUTHORITY, NT SERVICE accounts
+		if !c.isKnownDomainSID(principal.SecurityIdentifier, info) {
 			continue
 		}
 
@@ -3094,7 +3132,7 @@ func (c *Collector) createADNodes(serverInfo *types.ServerInfo) error {
 			Properties: map[string]interface{}{
 				"name":              displayName,
 				"DNSHostName":       serverInfo.FQDN,
-				"domain":            c.config.Domain,
+				"domain":            c.domainOfServerInfo(serverInfo),
 				"isDomainPrincipal": true,
 				"SID":               serverInfo.ComputerSID,
 				"SAMAccountName":    samAccountName,
@@ -3120,11 +3158,14 @@ func (c *Collector) createADNodes(serverInfo *types.ServerInfo) error {
 		}
 	}
 
-	// Create Authenticated Users node if needed
+	// Create Authenticated Users node if needed. It is named after the SQL
+	// Server's own domain (BloodHound's DOMAIN-S-1-5-11 convention), which is
+	// --domain unless the server lives in a registered trusted domain.
 	if needsAuthUsersNode {
+		serverDomain := c.domainOfServerInfo(serverInfo)
 		authedUsersSID := "S-1-5-11"
-		if c.config.Domain != "" {
-			authedUsersSID = c.config.Domain + "-S-1-5-11"
+		if serverDomain != "" {
+			authedUsersSID = serverDomain + "-S-1-5-11"
 		}
 
 		if !createdNodes[authedUsersSID] {
@@ -3132,7 +3173,7 @@ func (c *Collector) createADNodes(serverInfo *types.ServerInfo) error {
 				ID:    authedUsersSID,
 				Kinds: []string{bloodhound.NodeKinds.Group, "Base"},
 				Properties: map[string]interface{}{
-					"name": "AUTHENTICATED USERS@" + c.config.Domain,
+					"name": "AUTHENTICATED USERS@" + serverDomain,
 				},
 			}
 			addADNode(node)
@@ -3142,31 +3183,31 @@ func (c *Collector) createADNodes(serverInfo *types.ServerInfo) error {
 
 	// Resolve domain login SIDs via LDAP for AD enrichment (matching PowerShell behavior).
 	// This provides properties like SAMAccountName, distinguishedName, DNSHostName, etc.
+	//
+	// Each SID is resolved by the domain that owns it (see domainClientSet).
+	// This matters for logins from trusted domains: the home DC holds only a
+	// ForeignSecurityPrincipal stand-in for them, whose empty attributes
+	// would otherwise overwrite the real object's properties in BloodHound.
+	// Only SIDs of known domains are looked up; machine-local SIDs never
+	// resolve in AD and are skipped below anyway.
 	resolvedPrincipals := make(map[string]*types.DomainPrincipal)
 	if !c.config.SkipADNodeCreation && c.config.Domain != "" {
-		adClient := c.newADClient(c.config.Domain)
-		if adClient != nil {
-			for _, principal := range serverInfo.ServerPrincipals {
-				if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
-					continue
-				}
-				if !strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") {
-					continue
-				}
-				if _, already := resolvedPrincipals[principal.SecurityIdentifier]; already {
-					continue
-				}
-				resolved, err := adClient.ResolveSID(principal.SecurityIdentifier)
-				if err != nil && isLDAPAuthError(err) {
-					c.setLDAPAuthFailed()
-					break
-				}
-				if err == nil && resolved != nil {
-					resolvedPrincipals[principal.SecurityIdentifier] = resolved
-				}
+		adClients := c.newDomainClientSet()
+		for _, principal := range serverInfo.ServerPrincipals {
+			if !principal.IsActiveDirectoryPrincipal || principal.SecurityIdentifier == "" {
+				continue
 			}
-			adClient.Close()
+			if !c.isKnownDomainSID(principal.SecurityIdentifier, serverInfo) {
+				continue
+			}
+			if _, already := resolvedPrincipals[principal.SecurityIdentifier]; already {
+				continue
+			}
+			if resolved, err := adClients.resolveSID(principal.SecurityIdentifier); err == nil && resolved != nil {
+				resolvedPrincipals[principal.SecurityIdentifier] = resolved
+			}
 		}
+		adClients.Close()
 	}
 
 	// Create nodes for domain principals with SQL logins
@@ -3175,9 +3216,9 @@ func (c *Collector) createADNodes(serverInfo *types.ServerInfo) error {
 			continue
 		}
 
-		// Only process SIDs from the domain, skip NT AUTHORITY, NT SERVICE, and local accounts
-		// The DomainSID (e.g., S-1-5-21-462691900-2967613020-3702357964) identifies domain principals
-		if serverInfo.DomainSID == "" || !strings.HasPrefix(principal.SecurityIdentifier, serverInfo.DomainSID+"-") {
+		// Only process SIDs from AD domains (the server's own domain or a known
+		// trusted domain); skip NT AUTHORITY, NT SERVICE, and local accounts.
+		if !c.isKnownDomainSID(principal.SecurityIdentifier, serverInfo) {
 			continue
 		}
 
@@ -3223,13 +3264,15 @@ func (c *Collector) createADNodes(serverInfo *types.ServerInfo) error {
 		}
 
 		// Build the display name: strip NETBIOS prefix (DOMAIN\user → user) then
-		// append @DOMAIN.COM to match BloodHound's NAME@DOMAIN.COM convention.
+		// append @DOMAIN.COM to match BloodHound's NAME@DOMAIN.COM convention,
+		// using the domain that owns the SID (a trusted domain's principal is
+		// TRUSTED.LOCAL, not --domain).
 		displayName := principal.Name
 		if idx := strings.Index(displayName, "\\"); idx != -1 {
 			displayName = displayName[idx+1:]
 		}
-		if c.config.Domain != "" && !strings.Contains(displayName, "@") {
-			displayName = displayName + "@" + c.config.Domain
+		if principalDomain := c.principalDomainName(principal.SecurityIdentifier, serverInfo); principalDomain != "" && !strings.Contains(displayName, "@") {
+			displayName = displayName + "@" + principalDomain
 		}
 
 		nodeProps := map[string]interface{}{
@@ -3272,16 +3315,9 @@ func (c *Collector) createADNodes(serverInfo *types.ServerInfo) error {
 		}
 
 		// Identify local groups: BUILTIN (S-1-5-32-*) or machine-local Windows groups
-		// Machine-local groups have S-1-5-21-* SIDs belonging to the machine, not the domain
-		isLocalGroup := false
-		if strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-32-") {
-			isLocalGroup = true
-		} else if principal.TypeDescription == "WINDOWS_GROUP" &&
-			strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") &&
-			(serverInfo.DomainSID == "" || !strings.HasPrefix(principal.SecurityIdentifier, serverInfo.DomainSID+"-")) {
-			isLocalGroup = true
-		}
-		if !isLocalGroup {
+		// Machine-local groups have S-1-5-21-* SIDs belonging to the machine, not
+		// to any known domain (trusted-domain groups are domain groups).
+		if !c.isLocalGroupPrincipal(principal, serverInfo) {
 			continue
 		}
 
@@ -4007,8 +4043,8 @@ func (c *Collector) createEdges(writer edgeSink, serverInfo *types.ServerInfo) e
 			// Create edge from Authenticated Users (S-1-5-11) to the SQL login
 			// The SID S-1-5-11 is prefixed with the domain for the full ObjectIdentifier
 			authedUsersSID := "S-1-5-11"
-			if c.config.Domain != "" {
-				authedUsersSID = c.config.Domain + "-S-1-5-11"
+			if serverDomain := c.domainOfServerInfo(serverInfo); serverDomain != "" {
+				authedUsersSID = serverDomain + "-S-1-5-11"
 			}
 
 			edge := c.createEdge(
@@ -4036,7 +4072,12 @@ func (c *Collector) createEdges(writer edgeSink, serverInfo *types.ServerInfo) e
 
 				victimHost := strings.ToLower(computerName)
 				domainSuffix := ""
-				if serverInfo.FQDN != "" {
+				// A computer login from a registered trusted domain lives in that
+				// domain, not in the SQL Server's domain.
+				if e := c.domains.forSID(principal.SecurityIdentifier); e != nil && !e.isHome && e.DNSName != "" {
+					domainSuffix = "." + e.DNSName
+				}
+				if domainSuffix == "" && serverInfo.FQDN != "" {
 					if idx := strings.Index(serverInfo.FQDN, "."); idx >= 0 {
 						domainSuffix = serverInfo.FQDN[idx:]
 					}
@@ -4142,15 +4183,7 @@ func (c *Collector) createEdges(writer edgeSink, serverInfo *types.ServerInfo) e
 			}
 
 			// Identify local groups: BUILTIN (S-1-5-32-*) or machine-local Windows groups
-			isLocalGroup := false
-			if strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-32-") {
-				isLocalGroup = true
-			} else if principal.TypeDescription == "WINDOWS_GROUP" &&
-				strings.HasPrefix(principal.SecurityIdentifier, "S-1-5-21-") &&
-				(serverInfo.DomainSID == "" || !strings.HasPrefix(principal.SecurityIdentifier, serverInfo.DomainSID+"-")) {
-				isLocalGroup = true
-			}
-			if !isLocalGroup {
+			if !c.isLocalGroupPrincipal(principal, serverInfo) {
 				continue
 			}
 
@@ -4846,8 +4879,9 @@ func (c *Collector) processLinkedServers(serverInfo *types.ServerInfo, server *S
 				}
 			}
 
-			// Resolve ObjectIdentifier (needed for edge generation)
-			resolvedID := c.resolveDataSourceToSID(hostname, port, instanceName, sourceDomain)
+			// Resolve ObjectIdentifier (needed for edge generation) in the
+			// linked server's own domain when its FQDN names a known domain
+			resolvedID := c.resolveDataSourceToSID(hostname, port, instanceName, c.linkedServerDomain(sourceDomain, hostname))
 			ls.ResolvedObjectIdentifier = resolvedID
 		}
 		return
@@ -4867,6 +4901,10 @@ func (c *Collector) processLinkedServers(serverInfo *types.ServerInfo, server *S
 		// Formats: hostname, hostname:port, hostname\instance, hostname,port
 		hostname, port, instanceName := c.parseDataSource(targetHost)
 
+		// Every name seen for the target (DataSource host, reverse-DNS names);
+		// any FQDN among them can identify the linked server's domain.
+		hostCandidates := []string{hostname}
+
 		// Strip instance name if present for FQDN resolution
 		resolvedHost := hostname
 
@@ -4875,6 +4913,7 @@ func (c *Collector) processLinkedServers(serverInfo *types.ServerInfo, server *S
 			if names, err := net.LookupAddr(hostname); err == nil && len(names) > 0 {
 				// Use the first resolved name, strip trailing dot
 				resolvedHostFromIP := strings.TrimSuffix(names[0], ".")
+				hostCandidates = append(hostCandidates, resolvedHostFromIP)
 				// Extract just hostname part for SID resolution
 				if strings.Contains(resolvedHostFromIP, ".") {
 					hostname = strings.Split(resolvedHostFromIP, ".")[0]
@@ -4903,8 +4942,13 @@ func (c *Collector) processLinkedServers(serverInfo *types.ServerInfo, server *S
 			}
 		}
 
+		// The linked server's own domain: a registered domain matching one of
+		// its FQDNs (it may sit across a trust), else the source's domain.
+		hostCandidates = append(hostCandidates, resolvedHost)
+		targetDomain := c.linkedServerDomain(sourceDomain, hostCandidates...)
+
 		// Resolve the linked server's ResolvedObjectIdentifier (SID:port format)
-		resolvedID := c.resolveDataSourceToSID(hostname, port, instanceName, sourceDomain)
+		resolvedID := c.resolveDataSourceToSID(hostname, port, instanceName, targetDomain)
 		ls.ResolvedObjectIdentifier = resolvedID
 
 		// Check if already in queue
@@ -4919,7 +4963,7 @@ func (c *Collector) processLinkedServers(serverInfo *types.ServerInfo, server *S
 
 		// Add to queue if not already there
 		if !isAlreadyQueued {
-			c.addLinkedServerToQueue(resolvedHost, serverInfo.Hostname, sourceDomain)
+			c.addLinkedServerToQueue(resolvedHost, serverInfo.Hostname, targetDomain)
 		}
 	}
 }
@@ -4984,7 +5028,7 @@ func (c *Collector) resolveLinkedServerSourceID(sourceServer string, serverInfo 
 		}
 	}
 
-	resolved := c.resolveDataSourceToSID(hostname, port, instanceName, sourceDomain)
+	resolved := c.resolveDataSourceToSID(hostname, port, instanceName, c.linkedServerDomain(sourceDomain, hostname))
 
 	// Check if resolution succeeded (starts with S-1-5- means SID was resolved)
 	if strings.HasPrefix(resolved, "S-1-5-") {
@@ -5031,7 +5075,7 @@ func (c *Collector) resolveDataSourceToSID(hostname, port, instanceName, domain 
 
 			sid, err = adClient.ResolveComputerSID(machineName)
 			if err != nil && isLDAPAuthError(err) {
-				c.setLDAPAuthFailed()
+				c.setLDAPAuthFailed(domain)
 			} else if err == nil && sid != "" {
 				if instanceName != "" {
 					return fmt.Sprintf("%s:%s", sid, instanceName)
@@ -5049,22 +5093,55 @@ func (c *Collector) resolveDataSourceToSID(hostname, port, instanceName, domain 
 }
 
 // addLinkedServerToQueue adds a discovered linked server to the queue for later processing
+//
+// The SID lookup runs without holding linkedServersMu: it may bind to a DC
+// (possibly in another domain, with dial timeouts of up to 30s per
+// transport), and holding the lock would stall every other worker that
+// discovers a linked server meanwhile. The duplicate check is therefore done
+// before the lookup and repeated, under the lock, before appending.
 func (c *Collector) addLinkedServerToQueue(hostname string, discoveredFrom string, domain string) {
-	c.linkedServersMu.Lock()
-	defer c.linkedServersMu.Unlock()
-
-	// Check for duplicates
-	for _, ls := range c.linkedServersToProcess {
-		if strings.EqualFold(ls.Hostname, hostname) {
-			return
-		}
+	if c.isLinkedServerQueued(hostname) {
+		return
 	}
 
 	server := c.parseServerString(hostname)
 	server.DiscoveredFrom = discoveredFrom
 	server.Domain = domain
 	c.tryResolveSID(server, nil)
+
+	c.linkedServersMu.Lock()
+	defer c.linkedServersMu.Unlock()
+	for _, ls := range c.linkedServersToProcess {
+		if strings.EqualFold(ls.Hostname, hostname) {
+			return
+		}
+	}
 	c.linkedServersToProcess = append(c.linkedServersToProcess, server)
+}
+
+// isLinkedServerQueued reports whether hostname is already queued.
+func (c *Collector) isLinkedServerQueued(hostname string) bool {
+	c.linkedServersMu.Lock()
+	defer c.linkedServersMu.Unlock()
+	for _, ls := range c.linkedServersToProcess {
+		if strings.EqualFold(ls.Hostname, hostname) {
+			return true
+		}
+	}
+	return false
+}
+
+// linkedServerDomain returns the domain of a linked server target: the
+// registered domain matching any of its host names (the DataSource host or
+// its reverse-DNS FQDN), so a link into a trusted domain is resolved there;
+// otherwise the source server's domain (the historical behaviour).
+func (c *Collector) linkedServerDomain(sourceDomain string, hosts ...string) string {
+	for _, host := range hosts {
+		if e := c.domains.forHost(host); e != nil && e.DNSName != "" {
+			return strings.ToUpper(e.DNSName)
+		}
+	}
+	return sourceDomain
 }
 
 // processLinkedServersQueue processes discovered linked servers recursively
